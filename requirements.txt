@@ -1,0 +1,5 @@
+mne>=1.6
+numpy
+scipy
+matplotlib
+openpyxl

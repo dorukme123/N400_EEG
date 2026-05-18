@@ -1,0 +1,52 @@
+# Data directories (large EEG files, not tracked)
+inputs/*
+outputs/*
+logs/*
+!inputs/.gitkeep
+!outputs/.gitkeep
+!outputs/group/
+outputs/group/*
+!outputs/group/.gitkeep
+!logs/.gitkeep
+
+# Legacy directory names (case matters on Linux, Windows is case-insensitive)
+Example_inputs/
+Example_outputs/
+Test_inputs/
+Test_outputs/
+
+# Generated files
+*.fif
+*.html
+*_per_trial_n400.csv
+n400_group_table.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+~$*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp
+коментарии_extracted/
+
+# Internal docs (not needed in repo)
+MMNs_Files.txt
+N400.docx
+N400.pdf
+коментарии.docx
