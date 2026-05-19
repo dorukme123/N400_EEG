@@ -888,15 +888,24 @@ def plot_erp_with_n400_window(evoked, title, roi_chs=None):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
                                     gridspec_kw={'height_ratios': [1.2, 1]})
 
-    # ── Top: butterfly plot ──────────────────────────────────────────────
-    for i in range(data_uv.shape[0]):
-        ax1.plot(times, data_uv[i], linewidth=0.4, alpha=0.5)
+    # ── Top: butterfly plot (ROI channels only) ────────────────────────
+    if roi_chs:
+        roi_available = [ch for ch in roi_chs if ch in evoked.ch_names]
+        roi_idx = [evoked.ch_names.index(ch) for ch in roi_available]
+        butterfly_data = data_uv[roi_idx]
+    else:
+        roi_available = evoked.ch_names
+        butterfly_data = data_uv
+
+    for i in range(butterfly_data.shape[0]):
+        ax1.plot(times, butterfly_data[i], linewidth=0.6, alpha=0.6)
     ax1.axvspan(N400_TMIN * 1000, N400_TMAX * 1000,
                 alpha=0.15, color='blue', label='N400 window')
     ax1.axvline(0, color='black', linewidth=0.8, linestyle='--')
     ax1.axhline(0, color='grey', linewidth=0.5)
     ax1.set_ylabel('Amplitude (uV)')
-    ax1.set_title(f'{title} — all channels (N_ave={evoked.nave})')
+    ax1.set_title(f'{title} — ROI channels ({len(roi_available)} ch, '
+                  f'N_ave={evoked.nave})')
     ax1.legend(loc='upper right', fontsize=8)
 
     # ── Bottom: ROI average ──────────────────────────────────────────────
@@ -1006,6 +1015,54 @@ def plot_diff_wave(diff_evoked, title, roi_chs=None):
     return fig
 
 
+def plot_roi_channel_overlay(evoked, roi_chs, title):
+    """Plot each ROI channel as a separate line on one graph.
+
+    Shows individual channel contributions to the ROI average,
+    with N400 window shading and a legend identifying each channel.
+    """
+    times = evoked.times * 1000
+    data_uv = evoked.data * 1e6
+
+    available = [ch for ch in roi_chs if ch in evoked.ch_names]
+    if not available:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, f'{title}: no ROI channels available',
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+
+    # Use a distinguishable color cycle
+    cmap = plt.get_cmap('tab10')
+    colors = [cmap(i % 10) for i in range(len(available))]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    for ch, color in zip(available, colors):
+        idx = evoked.ch_names.index(ch)
+        ax.plot(times, data_uv[idx], color=color, linewidth=1.2,
+                alpha=0.8, label=ch)
+
+    # ROI average as thick dashed line
+    roi_idx = [evoked.ch_names.index(ch) for ch in available]
+    roi_mean = data_uv[roi_idx].mean(axis=0)
+    ax.plot(times, roi_mean, color='black', linewidth=2.0, linestyle='--',
+            alpha=0.9, label='ROI mean')
+
+    ax.axvspan(N400_TMIN * 1000, N400_TMAX * 1000,
+               alpha=0.12, color='blue')
+    ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
+    ax.axhline(0, color='grey', linewidth=0.5)
+    ax.set_xlabel('Time (ms)')
+    ax.set_ylabel('Amplitude (uV)')
+    ax.set_title(f'{title} — Individual ROI channels ({len(available)} ch)')
+    ax.legend(loc='upper right', fontsize=7, ncol=3)
+    ax.set_xticks(ERP_XTICKS)
+
+    fig.tight_layout()
+    return fig
+
+
 def plot_condition_topomaps(evoked, title):
     """Plot topographic maps at several time points across the N400 window.
 
@@ -1014,11 +1071,9 @@ def plot_condition_topomaps(evoked, title):
     try:
         fig = evoked.plot_topomap(
             times=TOPOMAP_TIMES, ch_type='eeg', average=None,
-            colorbar=True, show=False, time_unit='s',
-            title=f'{title} — Topography')
+            colorbar=True, show=False, time_unit='s')
         return fig
     except Exception:
-        # Fallback: create a simple placeholder
         fig, ax = plt.subplots(figsize=(10, 2))
         ax.text(0.5, 0.5, f'{title}: topographic map unavailable',
                 ha='center', va='center', fontsize=12)
@@ -1128,8 +1183,7 @@ def plot_peak_topomaps(evoked, title):
     try:
         fig = evoked.plot_topomap(
             times=peak_times, ch_type='eeg', average=None,
-            colorbar=True, show=False, time_unit='s',
-            title=f'{title} — Peak topography ({", ".join(labels)})')
+            colorbar=True, show=False, time_unit='s')
         return fig
     except Exception:
         fig, ax = plt.subplots(figsize=(10, 2))
@@ -1207,25 +1261,25 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
             ica.labels_ = {k: v for k, v in ica.labels_.items()
                            if not k.startswith('eog/')}
             indices, scores = ica.find_bads_eog(raw, ch_name=ch,
-                                                threshold=2.0,
+                                                threshold=1.5,
                                                 verbose='WARNING')
             if not indices:
-                # Clear again before retry
+                # Clear again before retry with lower threshold
                 ica.labels_ = {k: v for k, v in ica.labels_.items()
                                if not k.startswith('eog/')}
                 indices, scores = ica.find_bads_eog(raw, ch_name=ch,
-                                                    threshold=1.5,
+                                                    threshold=1.0,
                                                     verbose='WARNING')
             if indices:
-                logger.info(f'  {ch}: components {indices}')
+                logger.info(f'  EOG via {ch}: components {indices}')
             eog_scores_list.append(scores)
             all_eog_indices.update(indices)
 
         # Use the score array from the primary proxy for the report
         eog_scores = eog_scores_list[0] if eog_scores_list else None
 
-        # Cap at 4 to prevent over-rejection
         eog_indices = sorted(all_eog_indices)
+        # Cap at 4 to prevent over-rejection of EOG
         if len(eog_indices) > 4:
             logger.warning(f'Too many EOG components ({len(eog_indices)}), '
                            f'keeping top 4 by score')
@@ -1237,20 +1291,48 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
             else:
                 eog_indices = eog_indices[:4]
 
-        ica.exclude = eog_indices
-        ica.labels_ = {k: v for k, v in ica.labels_.items()
-                       if not k.startswith('eog/')}
         if eog_indices:
-            ica.labels_['eog'] = list(eog_indices)
-        if eog_indices:
-            logger.info(f'EOG components excluded: {eog_indices}')
+            logger.info(f'EOG components to exclude: {eog_indices}')
         else:
-            logger.warning('No EOG components found — ICA applied without '
-                           'exclusions')
+            logger.warning('No EOG components found')
     else:
         eog_indices = []
         eog_scores = None
-        logger.warning('No EOG proxy available — skipping ICA exclusion')
+        logger.warning('No EOG proxy available — skipping EOG detection')
+
+    # Auto-detect muscle artifacts
+    muscle_indices = []
+    try:
+        muscle_idx, muscle_scores = ica.find_bads_muscle(
+            raw, verbose='WARNING')
+        if muscle_idx:
+            # Cap at 2 muscle components to avoid over-rejection
+            if len(muscle_idx) > 2:
+                scored_m = [(abs(muscle_scores[i]), i) for i in muscle_idx
+                            if i < len(muscle_scores)]
+                scored_m.sort(reverse=True)
+                muscle_idx = sorted([i for _, i in scored_m[:2]])
+            muscle_indices = [i for i in muscle_idx if i not in eog_indices]
+            if muscle_indices:
+                logger.info(f'Muscle components to exclude: {muscle_indices}')
+    except Exception as e:
+        logger.debug(f'Muscle artifact detection skipped: {e}')
+
+    # Combine all artifact components
+    all_artifact_indices = sorted(set(eog_indices) | set(muscle_indices))
+    ica.exclude = all_artifact_indices
+    ica.labels_ = {k: v for k, v in ica.labels_.items()
+                   if not k.startswith('eog/') and not k.startswith('muscle/')}
+    if eog_indices:
+        ica.labels_['eog'] = list(eog_indices)
+    if muscle_indices:
+        ica.labels_['muscle'] = list(muscle_indices)
+    if all_artifact_indices:
+        logger.info(f'Total ICA components excluded: {all_artifact_indices} '
+                     f'(EOG: {eog_indices}, muscle: {muscle_indices})')
+    else:
+        logger.warning('No artifact components found — ICA applied without '
+                       'exclusions')
 
     ica.apply(raw, verbose='WARNING')
     logger.info('ICA applied')
@@ -1372,12 +1454,15 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     )
 
     # Section 2: Epochs after rejection
-    report.add_epochs(
-        epochs=epochs,
-        title='Epochs after rejection',
-        tags=('epochs', 'qc'),
-        psd=True,
-    )
+    if len(epochs) > 0:
+        report.add_epochs(
+            epochs=epochs,
+            title='Epochs after rejection',
+            tags=('epochs', 'qc'),
+            psd=True,
+        )
+    else:
+        logger.warning('All epochs rejected — skipping epochs report section')
 
     # Section 3: Test evoked responses (custom figures with N400 window)
     for cond in TEST_CONDITIONS:
@@ -1388,12 +1473,45 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
                               tags=('evoked', 'n400', 'test'))
             plt.close(fig)
 
+    # Section 3a2: ROI channel overlay per test condition
+    for cond in TEST_CONDITIONS:
+        if cond in evokeds:
+            fig = plot_roi_channel_overlay(evokeds[cond], N400_ROI_CHS, cond)
+            report.add_figure(fig, title=f'{cond} — ROI channels',
+                              tags=('evoked', 'n400', 'roi'))
+            plt.close(fig)
+
     # Section 3b: Topographic maps per test condition
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
             fig = plot_condition_topomaps(evokeds[cond], cond)
             report.add_figure(fig, title=f'{cond} — Topography',
                               tags=('topomap', 'n400', 'test'))
+            plt.close(fig)
+
+    # Section 3b2: Averaged topography around 400-500ms per test condition
+    for cond in TEST_CONDITIONS:
+        if cond in evokeds:
+            try:
+                fig = evokeds[cond].plot_topomap(
+                    times=[0.45], ch_type='eeg', average=0.1,
+                    colorbar=True, show=False, time_unit='s')
+                w, h = fig.get_size_inches()
+                fig.set_size_inches(w + 1.5, h + 0.8)
+                # Move colorbar away from topomap head
+                for ax in fig.get_axes():
+                    if ax.get_label() == '<colorbar>':
+                        pos = ax.get_position()
+                        ax.set_position([pos.x0 + 0.08, pos.y0,
+                                         pos.width, pos.height])
+                fig.subplots_adjust(top=0.82)
+            except Exception:
+                fig, ax = plt.subplots(figsize=(4, 3))
+                ax.text(0.5, 0.5, f'{cond}: avg topography unavailable',
+                        ha='center', va='center', fontsize=10)
+                ax.axis('off')
+            report.add_figure(fig, title=f'{cond} — Avg topo 400-500ms',
+                              tags=('topomap', 'n400', 'averaged'))
             plt.close(fig)
 
     # Section 3c: Per-electrode ERP grids per test condition

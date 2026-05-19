@@ -32,6 +32,9 @@ import matplotlib.pyplot as plt
 import mne
 import numpy as np
 
+from process_n400 import (plot_per_electrode_erps, plot_peak_topomaps,
+                          plot_roi_channel_overlay)
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 N400_TMIN = 0.2
@@ -49,24 +52,27 @@ N400_ROI_CHS = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4',
 REPORT_ELECTRODES = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4',
                      'CP1', 'CP2']
 
-# Group assignments (from reviewer feedback, Комментарии.docx, 2026-05-18)
+# Group assignments (from reviewer feedback, Комментарии N400.docx, 52 healthy)
 HEALTHY = {
     'INP0008', 'INP0019', 'INP0036', 'INP0037', 'INP0055', 'INP0064',
     'INP0086', 'INP0089', 'INP0092', 'INP0094', 'INP0096', 'INP0101',
-    'INP0102', 'INP0103', 'INP0104', 'INP0105', 'INP0106', 'INP0107',
+    'INP0102', 'INP0103', 'INP0104', 'INP0106', 'INP0107',
     'INP0110', 'INP0117', 'INP0125', 'INP0126', 'INP0129', 'INP0131',
     'INP0136', 'INP0138', 'INP0140', 'INP0144', 'INP0145', 'INP0146',
-    'INP0149', 'INP0150', 'INP0151', 'INP0152', 'INP0153', 'INP0154',
+    'INP0149', 'INP0150', 'INP0151', 'INP0152', 'INP0154',
     'INP0155', 'INP0156', 'INP0161', 'INP0163', 'INP0164', 'INP0165',
     'INP0172', 'INP0173', 'INP0174', 'INP0175', 'INP0180', 'INP0185',
     'INP0188', 'INP0189', 'INP0190', 'INP0196', 'INP0198', 'INP0200',
 }
+# 17 effective (reviewer excluded INP0116, INP0123)
 SPEECH_DISORDER = {
     'INP0014', 'INP0057', 'INP0076', 'INP0093', 'INP0100', 'INP0109',
-    'INP0112', 'INP0113', 'INP0116', 'INP0118', 'INP0123', 'INP0127',
+    'INP0112', 'INP0113', 'INP0118', 'INP0127',
     'INP0128', 'INP0148', 'INP0160', 'INP0166', 'INP0168', 'INP0177',
     'INP0186',
 }
+# Excluded per reviewer: INP0116 (no epochs), INP0123 (broken report)
+EXCLUDED = {'INP0116', 'INP0123'}
 
 # All conditions we want in the report
 ALL_CONDITIONS = (
@@ -483,8 +489,7 @@ def main():
             try:
                 fig = evk.plot_topomap(
                     times=TOPOMAP_TIMES, ch_type='eeg', average=None,
-                    colorbar=True, show=False, time_unit='s',
-                    title=f'{cond} [{group}] — Topography')
+                    colorbar=True, show=False, time_unit='s')
             except Exception:
                 fig, ax = plt.subplots(figsize=(10, 2))
                 ax.text(0.5, 0.5, f'{cond} [{group}]: topography unavailable',
@@ -492,6 +497,72 @@ def main():
                 ax.axis('off')
             report.add_figure(fig, title=f'{cond} [{group}] — Topography',
                               tags=('topomap', 'group'))
+            plt.close(fig)
+
+    # Section 1c: Averaged topography 400-500ms per test condition per group
+    for cond in test_conds:
+        for group in ('healthy', 'disorder'):
+            if group not in grand_avgs or cond not in grand_avgs[group]:
+                continue
+            evk = grand_avgs[group][cond]
+            try:
+                fig = evk.plot_topomap(
+                    times=[0.45], ch_type='eeg', average=0.1,
+                    colorbar=True, show=False, time_unit='s')
+                w, h = fig.get_size_inches()
+                fig.set_size_inches(w + 1.5, h + 0.8)
+                for ax in fig.get_axes():
+                    if ax.get_label() == '<colorbar>':
+                        pos = ax.get_position()
+                        ax.set_position([pos.x0 + 0.08, pos.y0,
+                                         pos.width, pos.height])
+                fig.subplots_adjust(top=0.82)
+            except Exception:
+                fig, ax = plt.subplots(figsize=(4, 3))
+                ax.text(0.5, 0.5, f'{cond} [{group}]: avg topo unavailable',
+                        ha='center', va='center', fontsize=10)
+                ax.axis('off')
+            report.add_figure(fig,
+                              title=f'{cond} [{group}] — Avg topo 400-500ms',
+                              tags=('topomap', 'group', 'averaged'))
+            plt.close(fig)
+
+    # Section 1d: Per-electrode ERPs per test condition per group
+    for cond in test_conds:
+        for group in ('healthy', 'disorder'):
+            if group not in grand_avgs or cond not in grand_avgs[group]:
+                continue
+            evk = grand_avgs[group][cond]
+            fig = plot_per_electrode_erps(evk, N400_ROI_CHS,
+                                          f'{cond} [{group}]')
+            report.add_figure(fig,
+                              title=f'{cond} [{group}] — Per-electrode',
+                              tags=('evoked', 'group', 'electrodes'))
+            plt.close(fig)
+
+    # Section 1e: Peak topomaps (Fz, Cz, Pz) per test condition per group
+    for cond in test_conds:
+        for group in ('healthy', 'disorder'):
+            if group not in grand_avgs or cond not in grand_avgs[group]:
+                continue
+            evk = grand_avgs[group][cond]
+            fig = plot_peak_topomaps(evk, f'{cond} [{group}]')
+            report.add_figure(fig,
+                              title=f'{cond} [{group}] — Peak topography',
+                              tags=('topomap', 'group', 'electrodes'))
+            plt.close(fig)
+
+    # Section 1f: ROI channel overlay per test condition per group
+    for cond in test_conds:
+        for group in ('healthy', 'disorder'):
+            if group not in grand_avgs or cond not in grand_avgs[group]:
+                continue
+            evk = grand_avgs[group][cond]
+            fig = plot_roi_channel_overlay(evk, N400_ROI_CHS,
+                                           f'{cond} [{group}]')
+            report.add_figure(fig,
+                              title=f'{cond} [{group}] — ROI channels',
+                              tags=('evoked', 'group', 'roi'))
             plt.close(fig)
 
     # Section 2: Within-block planned comparisons (per group)
