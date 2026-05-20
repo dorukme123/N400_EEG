@@ -20,7 +20,8 @@ from datetime import datetime
 from pathlib import Path
 
 # Fix Windows console encoding for Russian/Unicode text
-if sys.platform == 'win32':
+# Only when running as main script (not when imported by group_analysis)
+if sys.platform == 'win32' and __name__ == '__main__':
     if sys.stdout and hasattr(sys.stdout, 'buffer'):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
                                       errors='replace')
@@ -875,12 +876,35 @@ def export_per_trial_n400(epochs, patient_id, output_dir, logger):
 
 # ── Custom ERP Figures ───────────────────────────────────────────────────────
 
-def plot_erp_with_n400_window(evoked, title, roi_chs=None):
+def compute_uniform_ylim(evokeds_dict, roi_chs, margin=1.1):
+    """Compute global (ymin, ymax) across all evokeds for ROI channels.
+
+    Returns (ymin, ymax) in uV with a small margin, or None if empty.
+    """
+    global_min = np.inf
+    global_max = -np.inf
+    for evk in evokeds_dict.values():
+        available = [ch for ch in roi_chs if ch in evk.ch_names]
+        if not available:
+            continue
+        idx = [evk.ch_names.index(ch) for ch in available]
+        data_uv = evk.data[idx] * 1e6
+        global_min = min(global_min, data_uv.min())
+        global_max = max(global_max, data_uv.max())
+    if np.isinf(global_min):
+        return None
+    span = global_max - global_min
+    pad = span * (margin - 1) / 2
+    return (global_min - pad, global_max + pad)
+
+
+def plot_erp_with_n400_window(evoked, title, roi_chs=None, ylim=None):
     """Plot ERP butterfly + ROI average with N400 window shading.
 
     Returns a matplotlib Figure with two subplots:
       - Top: butterfly plot of all channels
       - Bottom: ROI channel average with N400 window highlighted
+    If ylim is given as (ymin, ymax), both axes use that range.
     """
     times = evoked.times * 1000  # to ms
     data_uv = evoked.data * 1e6  # to uV
@@ -950,6 +974,9 @@ def plot_erp_with_n400_window(evoked, title, roi_chs=None):
     ax2.set_title(f'{title} — ROI average')
     ax2.legend(loc='upper right', fontsize=8)
 
+    if ylim is not None:
+        ax1.set_ylim(ylim)
+        ax2.set_ylim(ylim)
     ax1.set_xticks(ERP_XTICKS)
     ax2.set_xticks(ERP_XTICKS)
 
@@ -957,11 +984,12 @@ def plot_erp_with_n400_window(evoked, title, roi_chs=None):
     return fig
 
 
-def plot_diff_wave(diff_evoked, title, roi_chs=None):
+def plot_diff_wave(diff_evoked, title, roi_chs=None, ylim=None):
     """Plot difference wave (real - pseudo) with N400 window.
 
     Returns a matplotlib Figure showing the ROI-averaged difference wave
     with the N400 window highlighted and zero line.
+    If ylim is given as (ymin, ymax), the axis uses that range.
     """
     times = diff_evoked.times * 1000
     data_uv = diff_evoked.data * 1e6
@@ -1005,6 +1033,8 @@ def plot_diff_wave(diff_evoked, title, roi_chs=None):
                alpha=0.12, color='blue', label='N400 window')
     ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
     ax.axhline(0, color='grey', linewidth=0.8, linestyle='-')
+    if ylim is not None:
+        ax.set_ylim(ylim)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('Amplitude (uV)')
     ax.set_title(title)
@@ -1015,11 +1045,12 @@ def plot_diff_wave(diff_evoked, title, roi_chs=None):
     return fig
 
 
-def plot_roi_channel_overlay(evoked, roi_chs, title):
+def plot_roi_channel_overlay(evoked, roi_chs, title, ylim=None):
     """Plot each ROI channel as a separate line on one graph.
 
     Shows individual channel contributions to the ROI average,
     with N400 window shading and a legend identifying each channel.
+    If ylim is given as (ymin, ymax), the axis uses that range.
     """
     times = evoked.times * 1000
     data_uv = evoked.data * 1e6
@@ -1053,6 +1084,8 @@ def plot_roi_channel_overlay(evoked, roi_chs, title):
                alpha=0.12, color='blue')
     ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
     ax.axhline(0, color='grey', linewidth=0.5)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('Amplitude (uV)')
     ax.set_title(f'{title} — Individual ROI channels ({len(available)} ch)')
@@ -1081,7 +1114,7 @@ def plot_condition_topomaps(evoked, title):
         return fig
 
 
-def plot_per_electrode_erps(evoked, roi_chs, title):
+def plot_per_electrode_erps(evoked, roi_chs, title, ylim=None):
     """Plot ERP waveform for each ROI electrode in an anatomical grid.
 
     Returns a matplotlib Figure with 4x3 subplots:
@@ -1089,6 +1122,7 @@ def plot_per_electrode_erps(evoked, roi_chs, title):
       Row 1: C3, Cz, C4
       Row 2: CP1, (empty), CP2
       Row 3: P3, Pz, P4
+    If ylim is given as (ymin, ymax), all subplots use that range.
     """
     grid = [
         ['F3', 'Fz', 'F4'],
@@ -1147,8 +1181,95 @@ def plot_per_electrode_erps(evoked, roi_chs, title):
         if ax.axison:
             ax.set_ylabel('uV', fontsize=8)
 
+    if ylim is not None:
+        axes[0][0].set_ylim(ylim)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
+
+
+def find_best_n400_channels(evoked):
+    """Find the channel with the strongest N400 peak (most negative) in 200-600ms.
+
+    Searches all EEG channels (excluding M1, M2, EOG).
+    Returns (best_ch, peak_amp_uv, peak_lat_ms) or (None, None, None).
+    """
+    exclude = {'M1', 'M2', 'EOG'}
+    t_mask = (evoked.times >= N400_TMIN) & (evoked.times <= N400_TMAX)
+    if not t_mask.any():
+        return None, None, None
+    times_ms = evoked.times[t_mask] * 1000
+
+    best_ch = None
+    best_amp = 0  # looking for most negative
+    best_lat = 0
+    for i, ch in enumerate(evoked.ch_names):
+        if ch in exclude:
+            continue
+        info_ch = evoked.info['chs'][i]
+        if info_ch['kind'] != mne.io.constants.FIFF.FIFFV_EEG_CH:
+            continue
+        trace_uv = evoked.data[i, t_mask] * 1e6
+        peak_val = trace_uv.min()
+        if peak_val < best_amp:
+            best_amp = peak_val
+            best_lat = times_ms[np.argmin(trace_uv)]
+            best_ch = ch
+    return best_ch, best_amp, best_lat
+
+
+def plot_best_n400_summary(evokeds, test_conditions, title):
+    """Plot waveforms from the best N400 channel for each test condition.
+
+    One subplot per condition showing the single channel where N400
+    is most pronounced, plus a summary table.
+    """
+    results = {}
+    for cond in test_conditions:
+        if cond not in evokeds:
+            continue
+        ch, amp, lat = find_best_n400_channels(evokeds[cond])
+        if ch is not None:
+            results[cond] = (ch, amp, lat)
+
+    if not results:
+        fig, ax = plt.subplots(figsize=(10, 2))
+        ax.text(0.5, 0.5, f'{title}: no N400 peaks found',
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig, {}
+
+    n = len(results)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 3 * n), sharex=True,
+                              squeeze=False)
+    fig.suptitle(f'{title} — Best N400 channel per condition', fontsize=13,
+                 y=1.0)
+
+    for idx, (cond, (ch, amp, lat)) in enumerate(results.items()):
+        ax = axes[idx][0]
+        evk = evokeds[cond]
+        ch_idx = evk.ch_names.index(ch)
+        times = evk.times * 1000
+        trace = evk.data[ch_idx] * 1e6
+
+        ax.plot(times, trace, color='steelblue', linewidth=1.5)
+        ax.axvspan(N400_TMIN * 1000, N400_TMAX * 1000,
+                   alpha=0.12, color='blue')
+        ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
+        ax.axhline(0, color='grey', linewidth=0.5)
+        ax.plot(lat, amp, 'rv', markersize=10)
+        ax.annotate(f'{amp:.1f} uV @ {lat:.0f} ms',
+                     xy=(lat, amp), xytext=(lat + 40, amp - 2),
+                     fontsize=9, color='red', fontweight='bold',
+                     arrowprops=dict(arrowstyle='->', color='red', lw=1))
+        ax.set_ylabel('uV')
+        ax.set_title(f'{cond} — best channel: {ch}  '
+                     f'(peak: {amp:.1f} uV @ {lat:.0f} ms)',
+                     fontsize=11, fontweight='bold')
+        ax.set_xticks(ERP_XTICKS)
+
+    axes[-1][0].set_xlabel('Time (ms)')
+    fig.tight_layout()
+    return fig, results
 
 
 def plot_peak_topomaps(evoked, title):
@@ -1196,7 +1317,9 @@ def plot_peak_topomaps(evoked, title):
 # ── Main Pipeline ────────────────────────────────────────────────────────────
 
 def process_single_file(vhdr_path, output_dir, log_dir, logger,
-                        epoch_reject_uv=EPOCH_REJECT_DEFAULT):
+                        epoch_reject_uv=EPOCH_REJECT_DEFAULT,
+                        detrend=False, uniform_scale=False,
+                        l_freq=FILTER_L_FREQ, h_freq=PREPROCESS_H_FREQ):
     """Run the full N400 processing pipeline on a single recording."""
     patient_id = extract_patient_id(vhdr_path)
     visit_info = extract_visit_info(vhdr_path)
@@ -1225,9 +1348,9 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     else:
         logger.info('No bad channels detected')
 
-    # ── 4. Preprocessing bandpass filter (0.1-45 Hz per spec) ─────────
-    logger.info(f'Preprocessing filter: {FILTER_L_FREQ}–{PREPROCESS_H_FREQ} Hz')
-    raw.filter(FILTER_L_FREQ, PREPROCESS_H_FREQ, verbose='WARNING')
+    # ── 4. Preprocessing bandpass filter ────────────────────────────────
+    logger.info(f'Preprocessing filter: {l_freq}–{h_freq} Hz')
+    raw.filter(l_freq, h_freq, verbose='WARNING')
 
     # ── 5. Resample ──────────────────────────────────────────────────────
     orig_sfreq = raw.info['sfreq']
@@ -1394,10 +1517,13 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
         epoch_reject = None
         logger.info('  Epoch rejection: DISABLED')
 
+    detrend_val = 1 if detrend else None
+    if detrend:
+        logger.info('  Linear detrending enabled')
     epochs = mne.Epochs(raw, events, event_id,
                         tmin=EPOCH_TMIN, tmax=EPOCH_TMAX,
                         baseline=BASELINE, preload=True,
-                        reject=epoch_reject,
+                        reject=epoch_reject, detrend=detrend_val,
                         verbose='WARNING')
 
     n_total = sum(1 for d in epochs.drop_log if not any('IGNORED' in s for s in d))
@@ -1438,6 +1564,13 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
                 [evokeds[real_cond], evokeds[pseudo_cond]], weights=[1, -1])
             n400_diffs[diff_name].comment = diff_name
 
+    # ── Compute uniform y-axis limits if requested ────────────────────
+    ylim = None
+    if uniform_scale:
+        ylim = compute_uniform_ylim(evokeds, N400_ROI_CHS)
+        if ylim:
+            logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
+
     # ── 13. Generate report ────────────────────────────────────────────
     logger.info('Generating report...')
     report = mne.Report(title=f'N400 report: {patient_id}', verbose='WARNING')
@@ -1468,7 +1601,7 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
             fig = plot_erp_with_n400_window(evokeds[cond], cond,
-                                            roi_chs=N400_ROI_CHS)
+                                            roi_chs=N400_ROI_CHS, ylim=ylim)
             report.add_figure(fig, title=cond,
                               tags=('evoked', 'n400', 'test'))
             plt.close(fig)
@@ -1476,7 +1609,8 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     # Section 3a2: ROI channel overlay per test condition
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
-            fig = plot_roi_channel_overlay(evokeds[cond], N400_ROI_CHS, cond)
+            fig = plot_roi_channel_overlay(evokeds[cond], N400_ROI_CHS, cond,
+                                          ylim=ylim)
             report.add_figure(fig, title=f'{cond} — ROI channels',
                               tags=('evoked', 'n400', 'roi'))
             plt.close(fig)
@@ -1517,7 +1651,8 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     # Section 3c: Per-electrode ERP grids per test condition
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
-            fig = plot_per_electrode_erps(evokeds[cond], N400_ROI_CHS, cond)
+            fig = plot_per_electrode_erps(evokeds[cond], N400_ROI_CHS, cond,
+                                         ylim=ylim)
             report.add_figure(fig, title=f'{cond} — Per-electrode',
                               tags=('evoked', 'n400', 'electrodes'))
             plt.close(fig)
@@ -1534,16 +1669,26 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     for key in ('n400_test_block1', 'n400_test_block2', 'n400_test_block3'):
         if key in n400_diffs:
             fig = plot_diff_wave(n400_diffs[key], key,
-                                 roi_chs=N400_ROI_CHS)
+                                 roi_chs=N400_ROI_CHS, ylim=ylim)
             report.add_figure(fig, title=key,
                               tags=('evoked', 'n400', 'difference'))
             plt.close(fig)
+
+    # Section 4b: Best N400 channel summary
+    fig, best_chs = plot_best_n400_summary(evokeds, TEST_CONDITIONS, patient_id)
+    report.add_figure(fig, title='Best N400 channel per condition',
+                      tags=('n400', 'best-channel', 'summary'))
+    plt.close(fig)
+    if best_chs:
+        logger.info('Best N400 channels:')
+        for cond, (ch, amp, lat) in best_chs.items():
+            logger.info(f'  {cond}: {ch} ({amp:.1f} uV @ {lat:.0f} ms)')
 
     # Section 5: Training evoked responses (custom figures with N400 window)
     for cond in TRAINING_CONDITIONS:
         if cond in evokeds:
             fig = plot_erp_with_n400_window(evokeds[cond], cond,
-                                            roi_chs=N400_ROI_CHS)
+                                            roi_chs=N400_ROI_CHS, ylim=ylim)
             report.add_figure(fig, title=cond,
                               tags=('evoked', 'training'))
             plt.close(fig)
@@ -1569,10 +1714,30 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
         logger.info(f'Evokeds saved: {fif_path}')
 
     # ── 15. Validate results ───────────────────────────────────────────
-    validate_results(patient_id, epochs, evokeds, n400_diffs, ica,
-                     eog_indices, n_dropped, bad_chs, patient_info, logger)
+    fails, warnings = validate_results(patient_id, epochs, evokeds,
+                                        n400_diffs, ica, eog_indices,
+                                        n_dropped, bad_chs, patient_info,
+                                        logger)
 
-    return output_path
+    # QC classification
+    n_total = len(epochs) + n_dropped
+    drop_pct = (n_dropped / n_total * 100) if n_total > 0 else 100
+    if fails > 0 or drop_pct > 15:
+        qc_status = 'noisy'
+    else:
+        qc_status = 'clean'
+    logger.info(f'QC status: {qc_status} (fails={fails}, warnings={warnings}, '
+                f'drop={drop_pct:.1f}%)')
+
+    return {
+        'report_path': output_path,
+        'qc_status': qc_status,
+        'drop_pct': drop_pct,
+        'n_epochs': len(epochs),
+        'n_dropped': n_dropped,
+        'fails': fails,
+        'warnings': warnings,
+    }
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -1586,9 +1751,75 @@ def parse_args():
     parser.add_argument('--reject', default=str(EPOCH_REJECT_DEFAULT),
                         help='Epoch rejection threshold in uV, or "none" to '
                              'disable (default: %(default)s)')
+    parser.add_argument('--l-freq', type=float, default=FILTER_L_FREQ,
+                        help='High-pass filter cutoff in Hz '
+                             f'(default: {FILTER_L_FREQ})')
+    parser.add_argument('--h-freq', type=float, default=PREPROCESS_H_FREQ,
+                        help='Low-pass filter cutoff in Hz '
+                             f'(default: {PREPROCESS_H_FREQ})')
+    parser.add_argument('--detrend', action='store_true',
+                        help='Apply linear detrending to epochs')
+    parser.add_argument('--uniform-scale', action='store_true',
+                        help='Use the same y-axis scale across all ERP plots')
+    parser.add_argument('--parallel', type=int, default=1, metavar='N',
+                        help='Process N patients in parallel (default: 1 = '
+                             'sequential)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose MNE output')
     return parser.parse_args()
+
+
+def _collect_result(status, pid, payload,
+                    clean_patients, noisy_patients, skipped, failures):
+    """Collect a single processing result into the appropriate list."""
+    if status == 'skip':
+        print(f'  SKIP {pid}: no N400 markers (possibly MMNs data)')
+        skipped.append((pid, payload))
+    elif status == 'clean':
+        print(f'  CLEAN {pid}: drop={payload["drop_pct"]:.1f}%, '
+              f'epochs={payload["n_epochs"]}')
+        clean_patients.append((pid, payload))
+    elif status == 'noisy':
+        print(f'  NOISY {pid}: drop={payload["drop_pct"]:.1f}%, '
+              f'epochs={payload["n_epochs"]}, fails={payload["fails"]}')
+        noisy_patients.append((pid, payload))
+    else:
+        print(f'  FAIL {pid}: {payload}')
+        failures.append((pid, payload))
+
+
+def _process_one(vhdr_path, output_dir, log_dir, epoch_reject_uv,
+                  detrend, uniform_scale, l_freq, h_freq, verbose):
+    """Worker function for processing a single patient.
+
+    Designed to run in a separate process via ProcessPoolExecutor.
+    Returns (status, patient_id, payload) where status is one of
+    'clean', 'noisy', 'skip', 'fail'.
+    """
+    # Each spawned process re-imports the module, so matplotlib backend
+    # and MNE log level are already configured.  Re-set log level in case
+    # this is called inside a new process where the main-guard hasn't run.
+    if not verbose:
+        mne.set_log_level('WARNING')
+
+    patient_id = extract_patient_id(vhdr_path)
+    logger = setup_logging(log_dir, patient_id)
+
+    try:
+        result = process_single_file(vhdr_path, output_dir, log_dir, logger,
+                                     epoch_reject_uv=epoch_reject_uv,
+                                     detrend=detrend,
+                                     uniform_scale=uniform_scale,
+                                     l_freq=l_freq, h_freq=h_freq)
+        if result is None:
+            return ('skip', patient_id, str(vhdr_path))
+        elif result['qc_status'] == 'clean':
+            return ('clean', patient_id, result)
+        else:
+            return ('noisy', patient_id, result)
+    except Exception as e:
+        logger.exception(f'Failed to process {vhdr_path}')
+        return ('fail', patient_id, str(e))
 
 
 def main():
@@ -1619,37 +1850,98 @@ def main():
     script_dir = Path(__file__).resolve().parent
     log_dir = script_dir / 'logs'
 
-    successes = []
+    clean_patients = []
+    noisy_patients = []
     skipped = []
     failures = []
 
-    for vhdr_path in vhdr_files:
-        patient_id = extract_patient_id(vhdr_path)
-        logger = setup_logging(log_dir, patient_id)
+    n_workers = max(1, args.parallel)
 
-        try:
-            report_path = process_single_file(vhdr_path, output_dir,
-                                              log_dir, logger,
-                                              epoch_reject_uv=epoch_reject_uv)
-            if report_path is None:
-                print(f'  SKIP {patient_id}: no N400 markers (possibly MMNs data)')
-                skipped.append((patient_id, vhdr_path))
-            else:
-                successes.append((patient_id, report_path))
-        except Exception as e:
-            logger.exception(f'Failed to process {vhdr_path}')
-            print(f'  FAIL {patient_id}: {e}')
-            failures.append((patient_id, vhdr_path))
+    if n_workers == 1:
+        # Sequential mode (original behaviour)
+        for vhdr_path in vhdr_files:
+            status, pid, payload = _process_one(
+                vhdr_path, output_dir, log_dir, epoch_reject_uv,
+                args.detrend, args.uniform_scale, args.l_freq, args.h_freq,
+                args.verbose)
+            _collect_result(status, pid, payload,
+                            clean_patients, noisy_patients, skipped, failures)
+    else:
+        # Parallel mode
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        print(f'Running with {n_workers} parallel workers')
+        futures = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for vhdr_path in vhdr_files:
+                fut = pool.submit(
+                    _process_one, vhdr_path, output_dir, log_dir,
+                    epoch_reject_uv, args.detrend, args.uniform_scale,
+                    args.l_freq, args.h_freq, args.verbose)
+                futures[fut] = vhdr_path
+            for fut in as_completed(futures):
+                vhdr_path = futures[fut]
+                try:
+                    status, pid, payload = fut.result()
+                except Exception as e:
+                    pid = extract_patient_id(vhdr_path)
+                    status, payload = 'fail', str(e)
+                _collect_result(status, pid, payload,
+                                clean_patients, noisy_patients, skipped,
+                                failures)
 
     # Summary
-    print(f'\nDone: {len(successes)} succeeded, '
+    n_ok = len(clean_patients) + len(noisy_patients)
+    print(f'\nDone: {n_ok} processed ({len(clean_patients)} clean, '
+          f'{len(noisy_patients)} noisy), '
           f'{len(skipped)} skipped, {len(failures)} failed')
-    for pid, path in successes:
-        print(f'  OK   {pid}: {path}')
-    for pid, path in skipped:
-        print(f'  SKIP {pid}: {path}')
-    for pid, path in failures:
-        print(f'  FAIL {pid}: {path}')
+
+    print('\n--- CLEAN patients ---')
+    for pid, res in clean_patients:
+        print(f'  {pid}: drop={res["drop_pct"]:.1f}%, '
+              f'epochs={res["n_epochs"]}, report={res["report_path"]}')
+    print(f'\n--- NOISY patients (>15% dropped or validation fails) ---')
+    for pid, res in noisy_patients:
+        print(f'  {pid}: drop={res["drop_pct"]:.1f}%, '
+              f'epochs={res["n_epochs"]}, fails={res["fails"]}, '
+              f'warnings={res["warnings"]}')
+    if skipped:
+        print('\n--- SKIPPED ---')
+        for pid, path in skipped:
+            print(f'  {pid}: {path}')
+    if failures:
+        print('\n--- FAILED ---')
+        for pid, path in failures:
+            print(f'  {pid}: {path}')
+
+    # Write QC summary file
+    qc_path = output_dir / 'qc_summary.txt'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(str(qc_path), 'w', encoding='utf-8') as f:
+        f.write(f'QC Summary — {datetime.now().strftime("%Y-%m-%d %H:%M")}\n')
+        f.write(f'Filter: {args.l_freq}-{args.h_freq} Hz, '
+                f'reject: {args.reject} uV, '
+                f'detrend: {args.detrend}\n')
+        f.write(f'Total: {n_ok} processed, {len(skipped)} skipped, '
+                f'{len(failures)} failed\n\n')
+        f.write(f'CLEAN ({len(clean_patients)}):\n')
+        for pid, res in sorted(clean_patients):
+            f.write(f'  {pid}  drop={res["drop_pct"]:.1f}%  '
+                    f'epochs={res["n_epochs"]}  '
+                    f'warnings={res["warnings"]}\n')
+        f.write(f'\nNOISY ({len(noisy_patients)}):\n')
+        for pid, res in sorted(noisy_patients):
+            f.write(f'  {pid}  drop={res["drop_pct"]:.1f}%  '
+                    f'epochs={res["n_epochs"]}  '
+                    f'fails={res["fails"]}  warnings={res["warnings"]}\n')
+        if skipped:
+            f.write(f'\nSKIPPED ({len(skipped)}):\n')
+            for pid, path in sorted(skipped):
+                f.write(f'  {pid}  {path}\n')
+        if failures:
+            f.write(f'\nFAILED ({len(failures)}):\n')
+            for pid, path in sorted(failures):
+                f.write(f'  {pid}  {path}\n')
+    print(f'\nQC summary saved: {qc_path}')
 
 
 if __name__ == '__main__':

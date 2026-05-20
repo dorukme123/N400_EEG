@@ -32,8 +32,9 @@ import matplotlib.pyplot as plt
 import mne
 import numpy as np
 
-from process_n400 import (plot_per_electrode_erps, plot_peak_topomaps,
-                          plot_roi_channel_overlay)
+from process_n400 import (compute_uniform_ylim, find_best_n400_channels,
+                          plot_best_n400_summary, plot_per_electrode_erps,
+                          plot_peak_topomaps, plot_roi_channel_overlay)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -156,6 +157,14 @@ def load_all_evokeds(input_dir, logger):
         name = fif_path.stem  # e.g. INP0089_посещение_5-ave
         pid = name.split('_')[0]
 
+        # Skip patients not in analysis groups
+        if pid in EXCLUDED:
+            logger.info(f'  {pid}: SKIPPED (excluded)')
+            continue
+        if pid not in HEALTHY and pid not in SPEECH_DISORDER:
+            logger.info(f'  {pid}: SKIPPED (not in healthy or disorder list)')
+            continue
+
         try:
             evokeds = mne.read_evokeds(str(fif_path), verbose='WARNING')
         except Exception as e:
@@ -168,14 +177,7 @@ def load_all_evokeds(input_dir, logger):
                 patient_data[evk.comment] = evk
 
         patients[pid] = patient_data
-
-        if pid in HEALTHY:
-            groups[pid] = 'healthy'
-        elif pid in SPEECH_DISORDER:
-            groups[pid] = 'disorder'
-        else:
-            groups[pid] = 'unknown'
-
+        groups[pid] = 'healthy' if pid in HEALTHY else 'disorder'
         logger.info(f'  {pid}: {len(patient_data)} conditions, '
                     f'group={groups[pid]}')
 
@@ -268,14 +270,14 @@ def measure_n400(evoked, electrodes):
 
 # ── Figures ──────────────────────────────────────────────────────────────────
 
-def plot_group_comparison(grand_avgs, cond, roi_chs, title=None):
+def plot_group_comparison(grand_avgs, cond, roi_chs, title=None, ylim=None):
     """Plot group overlay for a single condition — ROI average."""
     fig, ax = plt.subplots(figsize=(10, 4.5))
     colors = {'healthy': 'steelblue', 'disorder': 'indianred', 'unknown': 'grey'}
     labels = {'healthy': 'Healthy', 'disorder': 'Speech disorder',
               'unknown': 'Other'}
 
-    for group in ('healthy', 'disorder', 'unknown'):
+    for group in ('healthy', 'disorder'):
         if group not in grand_avgs or cond not in grand_avgs[group]:
             continue
         evk = grand_avgs[group][cond]
@@ -292,6 +294,8 @@ def plot_group_comparison(grand_avgs, cond, roi_chs, title=None):
                alpha=0.12, color='blue', label='N400 window')
     ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
     ax.axhline(0, color='grey', linewidth=0.5)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('Amplitude (uV)')
     ax.set_title(title or f'{cond} — Group comparison (ROI average)')
@@ -301,7 +305,8 @@ def plot_group_comparison(grand_avgs, cond, roi_chs, title=None):
     return fig
 
 
-def plot_comparison_pair(evk_a, evk_b, label_a, label_b, roi_chs, title):
+def plot_comparison_pair(evk_a, evk_b, label_a, label_b, roi_chs, title,
+                         ylim=None):
     """Plot two conditions overlaid + their difference, ROI-averaged."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
                                     gridspec_kw={'height_ratios': [1.2, 1]})
@@ -349,6 +354,9 @@ def plot_comparison_pair(evk_a, evk_b, label_a, label_b, roi_chs, title):
     ax2.set_title(f'Difference: {label_a} - {label_b}')
     ax2.legend(loc='upper right', fontsize=8)
 
+    if ylim is not None:
+        ax1.set_ylim(ylim)
+        ax2.set_ylim(ylim)
     ax1.set_xticks(ERP_XTICKS)
     ax2.set_xticks(ERP_XTICKS)
 
@@ -356,7 +364,7 @@ def plot_comparison_pair(evk_a, evk_b, label_a, label_b, roi_chs, title):
     return fig
 
 
-def plot_three_way(evokeds_list, labels, roi_chs, title):
+def plot_three_way(evokeds_list, labels, roi_chs, title, ylim=None):
     """Plot 3 conditions overlaid (for BTP vs BBTP vs BBBTP)."""
     fig, ax = plt.subplots(figsize=(10, 4.5))
     colors = ['steelblue', 'indianred', 'seagreen']
@@ -374,6 +382,8 @@ def plot_three_way(evokeds_list, labels, roi_chs, title):
                label='N400 window')
     ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
     ax.axhline(0, color='grey', linewidth=0.5)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('Amplitude (uV)')
     ax.set_title(title)
@@ -430,6 +440,8 @@ def main():
                         help='Directory containing *-ave.fif files')
     parser.add_argument('--output', required=True,
                         help='Output directory for group report and CSV')
+    parser.add_argument('--uniform-scale', action='store_true',
+                        help='Use the same y-axis scale across all ERP plots')
     args = parser.parse_args()
 
     mne.set_log_level('WARNING')
@@ -464,6 +476,18 @@ def main():
     csv_path = output_dir / 'n400_group_table.csv'
     export_group_table(grand_avgs, csv_path, logger)
 
+    # ── Compute uniform y-axis limits if requested ──────────────────────
+    ylim = None
+    if args.uniform_scale:
+        all_evokeds = {}
+        for group in ('healthy', 'disorder'):
+            if group in grand_avgs:
+                for cond, evk in grand_avgs[group].items():
+                    all_evokeds[f'{cond}_{group}'] = evk
+        ylim = compute_uniform_ylim(all_evokeds, N400_ROI_CHS)
+        if ylim:
+            logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
+
     # ── 4. Generate report ──────────────────────────────────────────────
     logger.info('Generating group report...')
     report = mne.Report(title='N400 Group Analysis', verbose='WARNING')
@@ -474,7 +498,7 @@ def main():
                        for g in ('healthy', 'disorder'))
         if not has_data:
             continue
-        fig = plot_group_comparison(grand_avgs, cond, N400_ROI_CHS)
+        fig = plot_group_comparison(grand_avgs, cond, N400_ROI_CHS, ylim=ylim)
         report.add_figure(fig, title=f'{cond} — group comparison',
                           tags=('group', 'evoked'))
         plt.close(fig)
@@ -516,7 +540,10 @@ def main():
                         pos = ax.get_position()
                         ax.set_position([pos.x0 + 0.08, pos.y0,
                                          pos.width, pos.height])
-                fig.subplots_adjust(top=0.82)
+                try:
+                    fig.subplots_adjust(top=0.82)
+                except Exception:
+                    pass
             except Exception:
                 fig, ax = plt.subplots(figsize=(4, 3))
                 ax.text(0.5, 0.5, f'{cond} [{group}]: avg topo unavailable',
@@ -534,7 +561,7 @@ def main():
                 continue
             evk = grand_avgs[group][cond]
             fig = plot_per_electrode_erps(evk, N400_ROI_CHS,
-                                          f'{cond} [{group}]')
+                                          f'{cond} [{group}]', ylim=ylim)
             report.add_figure(fig,
                               title=f'{cond} [{group}] — Per-electrode',
                               tags=('evoked', 'group', 'electrodes'))
@@ -559,11 +586,28 @@ def main():
                 continue
             evk = grand_avgs[group][cond]
             fig = plot_roi_channel_overlay(evk, N400_ROI_CHS,
-                                           f'{cond} [{group}]')
+                                           f'{cond} [{group}]', ylim=ylim)
             report.add_figure(fig,
                               title=f'{cond} [{group}] — ROI channels',
                               tags=('evoked', 'group', 'roi'))
             plt.close(fig)
+
+    # Section 1g: Best N400 channel summary per group
+    test_conds_tuple = ('BTR', 'BTP', 'BBTR', 'BBTP', 'BBBTR', 'BBBTP')
+    for group in ('healthy', 'disorder'):
+        if group not in grand_avgs:
+            continue
+        ga = grand_avgs[group]
+        fig, best_chs = plot_best_n400_summary(ga, test_conds_tuple,
+                                                group.capitalize())
+        report.add_figure(fig,
+                          title=f'Best N400 channel [{group}]',
+                          tags=('n400', 'best-channel', 'group'))
+        plt.close(fig)
+        if best_chs:
+            logger.info(f'Best N400 channels [{group}]:')
+            for cond, (ch, amp, lat) in best_chs.items():
+                logger.info(f'  {cond}: {ch} ({amp:.1f} uV @ {lat:.0f} ms)')
 
     # Section 2: Within-block planned comparisons (per group)
     logger.info('Plotting within-block comparisons...')
@@ -577,7 +621,7 @@ def main():
             fig = plot_comparison_pair(
                 ga[cond_a], ga[cond_b], cond_a, cond_b,
                 N400_ROI_CHS,
-                f'{comp_name} [{group}]')
+                f'{comp_name} [{group}]', ylim=ylim)
             report.add_figure(fig, title=f'{comp_name} [{group}]',
                               tags=('comparison', 'within-block'))
             plt.close(fig)
@@ -620,7 +664,7 @@ def main():
             fig = plot_comparison_pair(
                 evk_a, evk_b, label_a, label_b,
                 N400_ROI_CHS,
-                f'{comp_name} [{group}]')
+                f'{comp_name} [{group}]', ylim=ylim)
             report.add_figure(fig, title=f'{comp_name} [{group}]',
                               tags=('comparison', 'between-block'))
             plt.close(fig)
@@ -638,7 +682,7 @@ def main():
             fig = plot_three_way(
                 [v[0] for v in valid], [v[1] for v in valid],
                 N400_ROI_CHS,
-                f'BTP vs BBTP vs BBBTP [{group}]')
+                f'BTP vs BBTP vs BBBTP [{group}]', ylim=ylim)
             report.add_figure(fig,
                               title=f'BTP vs BBTP vs BBBTP [{group}]',
                               tags=('comparison', 'between-block'))
