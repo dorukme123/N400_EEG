@@ -688,10 +688,9 @@ def main():
         if ylim:
             logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
 
-    # ── Compute uniform topomap colour scale ──────────────────────────
-    vlim = compute_uniform_vlim(all_evokeds)
-    if vlim:
-        logger.info(f'Uniform topomap scale: {vlim[0]:.1f} to {vlim[1]:.1f} uV')
+    # ── Fixed topomap colour scale (±10 µV per reviewer) ──────────────
+    vlim = (-10, 10)
+    logger.info(f'Topomap scale: {vlim[0]} to {vlim[1]} uV')
 
     # ── 5. Generate report ──────────────────────────────────────────────
     logger.info('Generating group report...')

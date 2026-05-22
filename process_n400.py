@@ -1343,7 +1343,8 @@ def plot_peak_topomaps(evoked, title, vlim=None):
 def process_single_file(vhdr_path, output_dir, log_dir, logger,
                         epoch_reject_uv=EPOCH_REJECT_DEFAULT,
                         detrend=False, uniform_scale=False,
-                        l_freq=FILTER_L_FREQ, h_freq=PREPROCESS_H_FREQ):
+                        l_freq=FILTER_L_FREQ, h_freq=PREPROCESS_H_FREQ,
+                        n_jobs=1):
     """Run the full N400 processing pipeline on a single recording."""
     patient_id = extract_patient_id(vhdr_path)
     visit_info = extract_visit_info(vhdr_path)
@@ -1595,10 +1596,9 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
         if ylim:
             logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
 
-    # ── Compute uniform topomap colour scale ────────────────────────
-    vlim = compute_uniform_vlim(evokeds)
-    if vlim:
-        logger.info(f'Uniform topomap scale: {vlim[0]:.1f} to {vlim[1]:.1f} uV')
+    # ── Fixed topomap colour scale (±10 µV per reviewer) ─────────────
+    vlim = (-10, 10)
+    logger.info(f'Topomap scale: {vlim[0]} to {vlim[1]} uV')
 
     # ── 13. Generate report ────────────────────────────────────────────
     logger.info('Generating report...')
@@ -1626,103 +1626,141 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     else:
         logger.warning('All epochs rejected — skipping epochs report section')
 
-    # Section 3: Test evoked responses (custom figures with N400 window)
-    for cond in TEST_CONDITIONS:
-        if cond in evokeds:
-            fig = plot_erp_with_n400_window(evokeds[cond], cond,
-                                            roi_chs=N400_ROI_CHS, ylim=ylim)
-            report.add_figure(fig, title=cond,
-                              tags=('evoked', 'n400', 'test'))
-            plt.close(fig)
+    # ── Build figure jobs for parallel rendering ──────────────────────
+    #   Each job: (order, callable, title, tags)
+    #   callable returns a matplotlib Figure (or (fig, extra) for best_n400)
 
-    # Section 3a2: ROI channel overlay per test condition
-    for cond in TEST_CONDITIONS:
-        if cond in evokeds:
-            fig = plot_roi_channel_overlay(evokeds[cond], N400_ROI_CHS, cond,
-                                          ylim=ylim)
-            report.add_figure(fig, title=f'{cond} — ROI channels',
-                              tags=('evoked', 'n400', 'roi'))
-            plt.close(fig)
+    def _make_avg_topo(evk, cond, vlim):
+        topo_kw = dict(times=[0.45], ch_type='eeg', average=0.1,
+                       colorbar=True, show=False, time_unit='s')
+        if vlim is not None:
+            topo_kw['vlim'] = vlim
+        try:
+            fig = evk.plot_topomap(**topo_kw)
+            w, h = fig.get_size_inches()
+            fig.set_size_inches(w + 1.5, h + 0.8)
+            for ax in fig.get_axes():
+                if ax.get_label() == '<colorbar>':
+                    pos = ax.get_position()
+                    ax.set_position([pos.x0 + 0.08, pos.y0,
+                                     pos.width, pos.height])
+            fig.subplots_adjust(top=0.82)
+        except Exception:
+            fig, ax = plt.subplots(figsize=(4, 3))
+            ax.text(0.5, 0.5, f'{cond}: avg topography unavailable',
+                    ha='center', va='center', fontsize=10)
+            ax.axis('off')
+        return fig
 
-    # Section 3b: Topographic maps per test condition
-    for cond in TEST_CONDITIONS:
-        if cond in evokeds:
-            fig = plot_condition_topomaps(evokeds[cond], cond, vlim=vlim)
-            report.add_figure(fig, title=f'{cond} — Topography',
-                              tags=('topomap', 'n400', 'test'))
-            plt.close(fig)
+    fig_jobs = []   # (order, callable, title, tags)
+    order = 0
 
-    # Section 3b2: Averaged topography around 400-500ms per test condition
+    # Section 3: Test ERP + ROI + topomap + avg topo + per-electrode + peak
     for cond in TEST_CONDITIONS:
-        if cond in evokeds:
-            try:
-                topo_kw = dict(times=[0.45], ch_type='eeg', average=0.1,
-                               colorbar=True, show=False, time_unit='s')
-                if vlim is not None:
-                    topo_kw['vlim'] = vlim
-                fig = evokeds[cond].plot_topomap(**topo_kw)
-                w, h = fig.get_size_inches()
-                fig.set_size_inches(w + 1.5, h + 0.8)
-                # Move colorbar away from topomap head
-                for ax in fig.get_axes():
-                    if ax.get_label() == '<colorbar>':
-                        pos = ax.get_position()
-                        ax.set_position([pos.x0 + 0.08, pos.y0,
-                                         pos.width, pos.height])
-                fig.subplots_adjust(top=0.82)
-            except Exception:
-                fig, ax = plt.subplots(figsize=(4, 3))
-                ax.text(0.5, 0.5, f'{cond}: avg topography unavailable',
-                        ha='center', va='center', fontsize=10)
-                ax.axis('off')
-            report.add_figure(fig, title=f'{cond} — Avg topo 400-500ms',
-                              tags=('topomap', 'n400', 'averaged'))
-            plt.close(fig)
-
-    # Section 3c: Per-electrode ERP grids per test condition
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: plot_erp_with_n400_window(
+            e, c, roi_chs=N400_ROI_CHS, ylim=ylim), cond, ('evoked', 'n400', 'test')))
+        order += 1
     for cond in TEST_CONDITIONS:
-        if cond in evokeds:
-            fig = plot_per_electrode_erps(evokeds[cond], N400_ROI_CHS, cond,
-                                         ylim=ylim)
-            report.add_figure(fig, title=f'{cond} — Per-electrode',
-                              tags=('evoked', 'n400', 'electrodes'))
-            plt.close(fig)
-
-    # Section 3d: Peak topomaps (Fz, Cz, Pz) per test condition
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: plot_roi_channel_overlay(
+            e, N400_ROI_CHS, c, ylim=ylim), f'{cond} — ROI channels', ('evoked', 'n400', 'roi')))
+        order += 1
     for cond in TEST_CONDITIONS:
-        if cond in evokeds:
-            fig = plot_peak_topomaps(evokeds[cond], cond, vlim=vlim)
-            report.add_figure(fig, title=f'{cond} — Peak topography',
-                              tags=('topomap', 'n400', 'electrodes'))
-            plt.close(fig)
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: plot_condition_topomaps(
+            e, c, vlim=vlim), f'{cond} — Topography', ('topomap', 'n400', 'test')))
+        order += 1
+    for cond in TEST_CONDITIONS:
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: _make_avg_topo(
+            e, c, vlim), f'{cond} — Avg topo 400-500ms', ('topomap', 'n400', 'averaged')))
+        order += 1
+    for cond in TEST_CONDITIONS:
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: plot_per_electrode_erps(
+            e, N400_ROI_CHS, c, ylim=ylim), f'{cond} — Per-electrode', ('evoked', 'n400', 'electrodes')))
+        order += 1
+    for cond in TEST_CONDITIONS:
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: plot_peak_topomaps(
+            e, c, vlim=vlim), f'{cond} — Peak topography', ('topomap', 'n400', 'electrodes')))
+        order += 1
 
-    # Section 4: N400 difference waves (custom figures)
+    # Section 4: Difference waves
     for key in ('n400_test_block1', 'n400_test_block2', 'n400_test_block3'):
         if key in n400_diffs:
-            fig = plot_diff_wave(n400_diffs[key], key,
-                                 roi_chs=N400_ROI_CHS, ylim=ylim)
-            report.add_figure(fig, title=key,
-                              tags=('evoked', 'n400', 'difference'))
-            plt.close(fig)
+            evk = n400_diffs[key]
+            fig_jobs.append((order, lambda e=evk, k=key: plot_diff_wave(
+                e, k, roi_chs=N400_ROI_CHS, ylim=ylim), key, ('evoked', 'n400', 'difference')))
+            order += 1
 
-    # Section 4b: Best N400 channel summary
-    fig, best_chs = plot_best_n400_summary(evokeds, TEST_CONDITIONS, patient_id)
-    report.add_figure(fig, title='Best N400 channel per condition',
-                      tags=('n400', 'best-channel', 'summary'))
-    plt.close(fig)
+    # Section 4b: Best N400 summary (returns (fig, best_chs))
+    best_n400_order = order
+    fig_jobs.append((order, lambda: plot_best_n400_summary(
+        evokeds, TEST_CONDITIONS, patient_id),
+        'Best N400 channel per condition', ('n400', 'best-channel', 'summary')))
+    order += 1
+
+    # Section 5: Training ERPs
+    for cond in TRAINING_CONDITIONS:
+        if cond not in evokeds:
+            continue
+        evk = evokeds[cond]
+        fig_jobs.append((order, lambda e=evk, c=cond: plot_erp_with_n400_window(
+            e, c, roi_chs=N400_ROI_CHS, ylim=ylim), cond, ('evoked', 'training')))
+        order += 1
+
+    # ── Execute figure jobs ─────────────────────────────────────────────
+    effective_jobs = max(1, n_jobs)
+    if effective_jobs > 1 and len(fig_jobs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        logger.info(f'Rendering {len(fig_jobs)} figures with '
+                    f'{effective_jobs} threads...')
+        results = [None] * len(fig_jobs)
+
+        def _run_job(idx_job):
+            idx, func, title, tags = idx_job
+            return idx, func(), title, tags
+
+        with ThreadPoolExecutor(max_workers=effective_jobs) as pool:
+            for idx, result, title, tags in pool.map(
+                    _run_job, fig_jobs):
+                results[idx - fig_jobs[0][0]] = (result, title, tags)
+    else:
+        logger.info(f'Rendering {len(fig_jobs)} figures sequentially...')
+        results = []
+        for _order, func, title, tags in fig_jobs:
+            results.append((func(), title, tags))
+
+    # ── Add figures to report in order ──────────────────────────────────
+    best_chs = None
+    for i, (result, title, tags) in enumerate(results):
+        job_order = fig_jobs[i][0]
+        if job_order == best_n400_order:
+            # plot_best_n400_summary returns (fig, best_chs)
+            fig, best_chs = result
+        else:
+            fig = result
+        report.add_figure(fig, title=title, tags=tags)
+        plt.close(fig)
+
     if best_chs:
         logger.info('Best N400 channels:')
         for cond, (ch, amp, lat) in best_chs.items():
             logger.info(f'  {cond}: {ch} ({amp:.1f} uV @ {lat:.0f} ms)')
-
-    # Section 5: Training evoked responses (custom figures with N400 window)
-    for cond in TRAINING_CONDITIONS:
-        if cond in evokeds:
-            fig = plot_erp_with_n400_window(evokeds[cond], cond,
-                                            roi_chs=N400_ROI_CHS, ylim=ylim)
-            report.add_figure(fig, title=cond,
-                              tags=('evoked', 'training'))
-            plt.close(fig)
 
     # Save report
     output_dir = Path(output_dir)
@@ -1795,6 +1833,9 @@ def parse_args():
     parser.add_argument('--parallel', type=int, default=1, metavar='N',
                         help='Process N patients in parallel (default: 1 = '
                              'sequential)')
+    parser.add_argument('--jobs', type=int, default=4, metavar='J',
+                        help='Number of threads for figure rendering within '
+                             'each patient report (default: 4)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose MNE output')
     return parser.parse_args()
@@ -1820,7 +1861,7 @@ def _collect_result(status, pid, payload,
 
 
 def _process_one(vhdr_path, output_dir, log_dir, epoch_reject_uv,
-                  detrend, uniform_scale, l_freq, h_freq, verbose):
+                  detrend, uniform_scale, l_freq, h_freq, n_jobs, verbose):
     """Worker function for processing a single patient.
 
     Designed to run in a separate process via ProcessPoolExecutor.
@@ -1841,7 +1882,8 @@ def _process_one(vhdr_path, output_dir, log_dir, epoch_reject_uv,
                                      epoch_reject_uv=epoch_reject_uv,
                                      detrend=detrend,
                                      uniform_scale=uniform_scale,
-                                     l_freq=l_freq, h_freq=h_freq)
+                                     l_freq=l_freq, h_freq=h_freq,
+                                     n_jobs=n_jobs)
         if result is None:
             return ('skip', patient_id, str(vhdr_path))
         elif result['qc_status'] == 'clean':
@@ -1888,13 +1930,15 @@ def main():
 
     n_workers = max(1, args.parallel)
 
+    n_fig_jobs = max(1, args.jobs)
+
     if n_workers == 1:
         # Sequential mode (original behaviour)
         for vhdr_path in vhdr_files:
             status, pid, payload = _process_one(
                 vhdr_path, output_dir, log_dir, epoch_reject_uv,
                 args.detrend, args.uniform_scale, args.l_freq, args.h_freq,
-                args.verbose)
+                n_fig_jobs, args.verbose)
             _collect_result(status, pid, payload,
                             clean_patients, noisy_patients, skipped, failures)
     else:
@@ -1907,7 +1951,7 @@ def main():
                 fut = pool.submit(
                     _process_one, vhdr_path, output_dir, log_dir,
                     epoch_reject_uv, args.detrend, args.uniform_scale,
-                    args.l_freq, args.h_freq, args.verbose)
+                    args.l_freq, args.h_freq, n_fig_jobs, args.verbose)
                 futures[fut] = vhdr_path
             for fut in as_completed(futures):
                 vhdr_path = futures[fut]
