@@ -898,6 +898,26 @@ def compute_uniform_ylim(evokeds_dict, roi_chs, margin=1.1):
     return (global_min - pad, global_max + pad)
 
 
+def compute_uniform_vlim(evokeds_dict, margin=1.05):
+    """Compute symmetric (vmin, vmax) across all evokeds for topomap colour scale.
+
+    Uses all EEG channels across the N400 window (200-600 ms) to find the
+    global amplitude range, then returns a symmetric (-max, +max) limit so
+    that all topomaps share one colour bar.  Returns None if empty.
+    """
+    abs_max = 0.0
+    for evk in evokeds_dict.values():
+        t_mask = (evk.times >= N400_TMIN) & (evk.times <= N400_TMAX)
+        if not t_mask.any():
+            continue
+        data_uv = evk.data[:, t_mask] * 1e6
+        abs_max = max(abs_max, np.abs(data_uv).max())
+    if abs_max == 0.0:
+        return None
+    lim = abs_max * margin
+    return (-lim, lim)
+
+
 def plot_erp_with_n400_window(evoked, title, roi_chs=None, ylim=None):
     """Plot ERP butterfly + ROI average with N400 window shading.
 
@@ -1096,15 +1116,17 @@ def plot_roi_channel_overlay(evoked, roi_chs, title, ylim=None):
     return fig
 
 
-def plot_condition_topomaps(evoked, title):
+def plot_condition_topomaps(evoked, title, vlim=None):
     """Plot topographic maps at several time points across the N400 window.
 
     Returns a matplotlib Figure with one topomap per time point.
     """
+    kwargs = dict(times=TOPOMAP_TIMES, ch_type='eeg', average=None,
+                  colorbar=True, show=False, time_unit='s')
+    if vlim is not None:
+        kwargs['vlim'] = vlim
     try:
-        fig = evoked.plot_topomap(
-            times=TOPOMAP_TIMES, ch_type='eeg', average=None,
-            colorbar=True, show=False, time_unit='s')
+        fig = evoked.plot_topomap(**kwargs)
         return fig
     except Exception:
         fig, ax = plt.subplots(figsize=(10, 2))
@@ -1272,7 +1294,7 @@ def plot_best_n400_summary(evokeds, test_conditions, title):
     return fig, results
 
 
-def plot_peak_topomaps(evoked, title):
+def plot_peak_topomaps(evoked, title, vlim=None):
     """Plot topographic maps at peak N400 latency of Fz, Cz, Pz.
 
     Returns a matplotlib Figure with 3 topographic head plots.
@@ -1301,10 +1323,12 @@ def plot_peak_topomaps(evoked, title):
         ax.axis('off')
         return fig
 
+    kwargs = dict(times=peak_times, ch_type='eeg', average=None,
+                  colorbar=True, show=False, time_unit='s')
+    if vlim is not None:
+        kwargs['vlim'] = vlim
     try:
-        fig = evoked.plot_topomap(
-            times=peak_times, ch_type='eeg', average=None,
-            colorbar=True, show=False, time_unit='s')
+        fig = evoked.plot_topomap(**kwargs)
         return fig
     except Exception:
         fig, ax = plt.subplots(figsize=(10, 2))
@@ -1571,6 +1595,11 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
         if ylim:
             logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
 
+    # ── Compute uniform topomap colour scale ────────────────────────
+    vlim = compute_uniform_vlim(evokeds)
+    if vlim:
+        logger.info(f'Uniform topomap scale: {vlim[0]:.1f} to {vlim[1]:.1f} uV')
+
     # ── 13. Generate report ────────────────────────────────────────────
     logger.info('Generating report...')
     report = mne.Report(title=f'N400 report: {patient_id}', verbose='WARNING')
@@ -1618,7 +1647,7 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     # Section 3b: Topographic maps per test condition
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
-            fig = plot_condition_topomaps(evokeds[cond], cond)
+            fig = plot_condition_topomaps(evokeds[cond], cond, vlim=vlim)
             report.add_figure(fig, title=f'{cond} — Topography',
                               tags=('topomap', 'n400', 'test'))
             plt.close(fig)
@@ -1627,9 +1656,11 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
             try:
-                fig = evokeds[cond].plot_topomap(
-                    times=[0.45], ch_type='eeg', average=0.1,
-                    colorbar=True, show=False, time_unit='s')
+                topo_kw = dict(times=[0.45], ch_type='eeg', average=0.1,
+                               colorbar=True, show=False, time_unit='s')
+                if vlim is not None:
+                    topo_kw['vlim'] = vlim
+                fig = evokeds[cond].plot_topomap(**topo_kw)
                 w, h = fig.get_size_inches()
                 fig.set_size_inches(w + 1.5, h + 0.8)
                 # Move colorbar away from topomap head
@@ -1660,7 +1691,7 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
     # Section 3d: Peak topomaps (Fz, Cz, Pz) per test condition
     for cond in TEST_CONDITIONS:
         if cond in evokeds:
-            fig = plot_peak_topomaps(evokeds[cond], cond)
+            fig = plot_peak_topomaps(evokeds[cond], cond, vlim=vlim)
             report.add_figure(fig, title=f'{cond} — Peak topography',
                               tags=('topomap', 'n400', 'electrodes'))
             plt.close(fig)

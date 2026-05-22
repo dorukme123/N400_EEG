@@ -28,11 +28,15 @@ if sys.platform == 'win32':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8',
                                       errors='replace')
 
+import csv
+
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
+from scipy.stats import mannwhitneyu
 
-from process_n400 import (compute_uniform_ylim, find_best_n400_channels,
+from process_n400 import (compute_uniform_vlim, compute_uniform_ylim,
+                          find_best_n400_channels,
                           plot_best_n400_summary, plot_per_electrode_erps,
                           plot_peak_topomaps, plot_roi_channel_overlay)
 
@@ -53,27 +57,32 @@ N400_ROI_CHS = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4',
 REPORT_ELECTRODES = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4',
                      'CP1', 'CP2']
 
-# Group assignments (from reviewer feedback, Комментарии N400.docx, 52 healthy)
+# Group assignments (from reviewer feedback, Комментарии N400.docx)
+# 46 healthy (52 original minus 6 excluded: 94, 101, 117, 129, 131, 149)
 HEALTHY = {
     'INP0008', 'INP0019', 'INP0036', 'INP0037', 'INP0055', 'INP0064',
-    'INP0086', 'INP0089', 'INP0092', 'INP0094', 'INP0096', 'INP0101',
+    'INP0086', 'INP0089', 'INP0092', 'INP0096',
     'INP0102', 'INP0103', 'INP0104', 'INP0106', 'INP0107',
-    'INP0110', 'INP0117', 'INP0125', 'INP0126', 'INP0129', 'INP0131',
+    'INP0110', 'INP0125', 'INP0126',
     'INP0136', 'INP0138', 'INP0140', 'INP0144', 'INP0145', 'INP0146',
-    'INP0149', 'INP0150', 'INP0151', 'INP0152', 'INP0154',
+    'INP0150', 'INP0151', 'INP0152', 'INP0154',
     'INP0155', 'INP0156', 'INP0161', 'INP0163', 'INP0164', 'INP0165',
     'INP0172', 'INP0173', 'INP0174', 'INP0175', 'INP0180', 'INP0185',
     'INP0188', 'INP0189', 'INP0190', 'INP0196', 'INP0198', 'INP0200',
 }
-# 17 effective (reviewer excluded INP0116, INP0123)
+# 16 effective (19 original minus 3 excluded: 100, 116, 123)
 SPEECH_DISORDER = {
-    'INP0014', 'INP0057', 'INP0076', 'INP0093', 'INP0100', 'INP0109',
+    'INP0014', 'INP0057', 'INP0076', 'INP0093', 'INP0109',
     'INP0112', 'INP0113', 'INP0118', 'INP0127',
     'INP0128', 'INP0148', 'INP0160', 'INP0166', 'INP0168', 'INP0177',
     'INP0186',
 }
-# Excluded per reviewer: INP0116 (no epochs), INP0123 (broken report)
-EXCLUDED = {'INP0116', 'INP0123'}
+# Excluded per reviewer (ко.docx round 2 + prior):
+# INP0094, INP0100, INP0101, INP0116, INP0117, INP0123, INP0129, INP0131, INP0149
+EXCLUDED = {
+    'INP0094', 'INP0100', 'INP0101', 'INP0116', 'INP0117',
+    'INP0123', 'INP0129', 'INP0131', 'INP0149',
+}
 
 # All conditions we want in the report
 ALL_CONDITIONS = (
@@ -268,6 +277,162 @@ def measure_n400(evoked, electrodes):
     return results
 
 
+# ── Statistics ──────────────────────────────────────────────────────────────
+
+def measure_n400_individual(evoked, electrodes):
+    """Measure mean N400 amplitude (200-600 ms) for each electrode.
+
+    Returns dict: {electrode: mean_amplitude_uV}
+    """
+    t_mask = (evoked.times >= N400_TMIN) & (evoked.times <= N400_TMAX)
+    if not t_mask.any():
+        return {}
+    results = {}
+    for ch in electrodes:
+        if ch not in evoked.ch_names:
+            continue
+        idx = evoked.ch_names.index(ch)
+        data_uv = evoked.data[idx, t_mask] * 1e6
+        results[ch] = data_uv.mean()
+    # Cluster average
+    available = [ch for ch in electrodes if ch in evoked.ch_names]
+    if available:
+        idxs = [evoked.ch_names.index(ch) for ch in available]
+        results['cluster'] = (evoked.data[idxs][:, t_mask] * 1e6).mean()
+    return results
+
+
+def run_group_statistics(patients, groups, conditions, electrodes, logger):
+    """Run Mann-Whitney U tests comparing healthy vs disorder per condition/electrode.
+
+    Applies Bonferroni correction across the 6 test conditions (not per-electrode,
+    since ROI electrodes are spatially correlated and treated as a descriptive breakdown).
+
+    Returns list of dicts with test results, suitable for CSV export.
+    """
+    test_conditions = [c for c in conditions
+                       if c in ('BTR', 'BTP', 'BBTR', 'BBTP', 'BBBTR', 'BBBTP')]
+    n_comparisons = len(test_conditions)
+    all_electrodes = list(electrodes) + ['cluster']
+
+    results = []
+
+    for cond in test_conditions:
+        for elec in all_electrodes:
+            healthy_vals = []
+            disorder_vals = []
+
+            for pid, pdata in patients.items():
+                if cond not in pdata:
+                    continue
+                metrics = measure_n400_individual(pdata[cond], electrodes)
+                if elec not in metrics:
+                    continue
+                if groups[pid] == 'healthy':
+                    healthy_vals.append(metrics[elec])
+                else:
+                    disorder_vals.append(metrics[elec])
+
+            if len(healthy_vals) < 2 or len(disorder_vals) < 2:
+                continue
+
+            stat, p_raw = mannwhitneyu(healthy_vals, disorder_vals,
+                                       alternative='two-sided')
+            p_bonf = min(p_raw * n_comparisons, 1.0)
+
+            results.append({
+                'condition': cond,
+                'electrode': elec,
+                'n_healthy': len(healthy_vals),
+                'n_disorder': len(disorder_vals),
+                'mean_healthy': np.mean(healthy_vals),
+                'mean_disorder': np.mean(disorder_vals),
+                'U_statistic': stat,
+                'p_raw': p_raw,
+                'p_bonferroni': p_bonf,
+                'significant_raw': p_raw < 0.05,
+                'significant_bonf': p_bonf < 0.05,
+            })
+
+    logger.info(f'Mann-Whitney U tests: {len(results)} comparisons, '
+                f'Bonferroni factor = {n_comparisons}')
+    sig_raw = sum(1 for r in results if r['significant_raw'])
+    sig_bonf = sum(1 for r in results if r['significant_bonf'])
+    logger.info(f'  Significant (raw p<0.05): {sig_raw}')
+    logger.info(f'  Significant (Bonferroni p<0.05): {sig_bonf}')
+
+    return results
+
+
+def export_statistics_csv(stats_results, output_path, logger):
+    """Export Mann-Whitney U test results to CSV."""
+    if not stats_results:
+        logger.warning('No statistics to export')
+        return
+
+    with open(str(output_path), 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'Condition', 'Electrode', 'N_Healthy', 'N_Disorder',
+            'Mean_Healthy_uV', 'Mean_Disorder_uV',
+            'U_Statistic', 'p_raw', 'p_Bonferroni',
+            'Sig_raw_p05', 'Sig_Bonferroni_p05',
+        ])
+        for r in stats_results:
+            writer.writerow([
+                r['condition'], r['electrode'],
+                r['n_healthy'], r['n_disorder'],
+                f'{r["mean_healthy"]:.3f}', f'{r["mean_disorder"]:.3f}',
+                f'{r["U_statistic"]:.1f}',
+                f'{r["p_raw"]:.6f}', f'{r["p_bonferroni"]:.6f}',
+                r['significant_raw'], r['significant_bonf'],
+            ])
+    logger.info(f'Statistics CSV saved: {output_path}')
+
+
+def plot_statistics_table(stats_results, title='Mann-Whitney U: Healthy vs Disorder'):
+    """Create a figure with a summary table of significant results."""
+    sig = [r for r in stats_results if r['significant_raw']]
+    if not sig:
+        fig, ax = plt.subplots(figsize=(8, 2))
+        ax.text(0.5, 0.5, 'No significant differences (raw p < 0.05)',
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+
+    col_labels = ['Condition', 'Electrode', 'Healthy mean', 'Disorder mean',
+                  'U', 'p (raw)', 'p (Bonf.)', 'Sig (Bonf.)']
+    cell_text = []
+    cell_colors = []
+    for r in sig:
+        row = [
+            r['condition'], r['electrode'],
+            f'{r["mean_healthy"]:.2f}', f'{r["mean_disorder"]:.2f}',
+            f'{r["U_statistic"]:.0f}',
+            f'{r["p_raw"]:.4f}', f'{r["p_bonferroni"]:.4f}',
+            'Yes' if r['significant_bonf'] else 'No',
+        ]
+        cell_text.append(row)
+        bg = '#d4edda' if r['significant_bonf'] else '#fff3cd'
+        cell_colors.append([bg] * len(row))
+
+    n_rows = len(cell_text)
+    fig_h = max(2.5, 0.4 * n_rows + 1.5)
+    fig, ax = plt.subplots(figsize=(14, fig_h))
+    ax.axis('off')
+    ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
+
+    table = ax.table(cellText=cell_text, colLabels=col_labels,
+                     cellColours=cell_colors,
+                     colColours=['#d0d0d0'] * len(col_labels),
+                     loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.3)
+    fig.tight_layout()
+    return fig
+
+
 # ── Figures ──────────────────────────────────────────────────────────────────
 
 def plot_group_comparison(grand_avgs, cond, roi_chs, title=None, ylim=None):
@@ -364,6 +529,36 @@ def plot_comparison_pair(evk_a, evk_b, label_a, label_b, roi_chs, title,
     return fig
 
 
+def plot_difference_topomap(evk_a, evk_b, label_a, label_b, title, vlim=None):
+    """Plot topomap of the difference (A - B) averaged over N400 window."""
+    diff = mne.combine_evoked([evk_a, evk_b], weights=[1, -1])
+    diff.comment = f'{label_a} - {label_b}'
+    kwargs = dict(times=[0.45], ch_type='eeg', average=0.1,
+                  colorbar=True, show=False, time_unit='s')
+    if vlim is not None:
+        kwargs['vlim'] = vlim
+    try:
+        fig = diff.plot_topomap(**kwargs)
+        w, h = fig.get_size_inches()
+        fig.set_size_inches(w + 1.5, h + 0.8)
+        for ax in fig.get_axes():
+            if ax.get_label() == '<colorbar>':
+                pos = ax.get_position()
+                ax.set_position([pos.x0 + 0.08, pos.y0,
+                                 pos.width, pos.height])
+        try:
+            fig.suptitle(title, fontsize=11)
+            fig.subplots_adjust(top=0.82)
+        except Exception:
+            pass
+    except Exception:
+        fig, ax = plt.subplots(figsize=(4, 3))
+        ax.text(0.5, 0.5, f'{title}: diff topo unavailable',
+                ha='center', va='center', fontsize=10)
+        ax.axis('off')
+    return fig
+
+
 def plot_three_way(evokeds_list, labels, roi_chs, title, ylim=None):
     """Plot 3 conditions overlaid (for BTP vs BBTP vs BBBTP)."""
     fig, ax = plt.subplots(figsize=(10, 4.5))
@@ -397,8 +592,6 @@ def plot_three_way(evokeds_list, labels, roi_chs, title, ylim=None):
 
 def export_group_table(grand_avgs, output_path, logger):
     """Export N400 metrics per group/condition/electrode to CSV."""
-    import csv
-
     electrodes = REPORT_ELECTRODES + ['cluster']
     conditions = [c for c in ALL_CONDITIONS]
 
@@ -476,19 +669,31 @@ def main():
     csv_path = output_dir / 'n400_group_table.csv'
     export_group_table(grand_avgs, csv_path, logger)
 
+    # ── 4. Mann-Whitney U statistics (healthy vs disorder) ─────────────
+    logger.info('Running Mann-Whitney U tests (Bonferroni-corrected)...')
+    stats_results = run_group_statistics(patients, groups, ALL_CONDITIONS,
+                                         REPORT_ELECTRODES, logger)
+    stats_csv = output_dir / 'n400_group_statistics.csv'
+    export_statistics_csv(stats_results, stats_csv, logger)
+
     # ── Compute uniform y-axis limits if requested ──────────────────────
     ylim = None
+    all_evokeds = {}
+    for group in ('healthy', 'disorder'):
+        if group in grand_avgs:
+            for cond, evk in grand_avgs[group].items():
+                all_evokeds[f'{cond}_{group}'] = evk
     if args.uniform_scale:
-        all_evokeds = {}
-        for group in ('healthy', 'disorder'):
-            if group in grand_avgs:
-                for cond, evk in grand_avgs[group].items():
-                    all_evokeds[f'{cond}_{group}'] = evk
         ylim = compute_uniform_ylim(all_evokeds, N400_ROI_CHS)
         if ylim:
             logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
 
-    # ── 4. Generate report ──────────────────────────────────────────────
+    # ── Compute uniform topomap colour scale ──────────────────────────
+    vlim = compute_uniform_vlim(all_evokeds)
+    if vlim:
+        logger.info(f'Uniform topomap scale: {vlim[0]:.1f} to {vlim[1]:.1f} uV')
+
+    # ── 5. Generate report ──────────────────────────────────────────────
     logger.info('Generating group report...')
     report = mne.Report(title='N400 Group Analysis', verbose='WARNING')
 
@@ -510,10 +715,12 @@ def main():
             if group not in grand_avgs or cond not in grand_avgs[group]:
                 continue
             evk = grand_avgs[group][cond]
+            topo_kw = dict(times=TOPOMAP_TIMES, ch_type='eeg', average=None,
+                           colorbar=True, show=False, time_unit='s')
+            if vlim is not None:
+                topo_kw['vlim'] = vlim
             try:
-                fig = evk.plot_topomap(
-                    times=TOPOMAP_TIMES, ch_type='eeg', average=None,
-                    colorbar=True, show=False, time_unit='s')
+                fig = evk.plot_topomap(**topo_kw)
             except Exception:
                 fig, ax = plt.subplots(figsize=(10, 2))
                 ax.text(0.5, 0.5, f'{cond} [{group}]: topography unavailable',
@@ -529,10 +736,12 @@ def main():
             if group not in grand_avgs or cond not in grand_avgs[group]:
                 continue
             evk = grand_avgs[group][cond]
+            avg_kw = dict(times=[0.45], ch_type='eeg', average=0.1,
+                          colorbar=True, show=False, time_unit='s')
+            if vlim is not None:
+                avg_kw['vlim'] = vlim
             try:
-                fig = evk.plot_topomap(
-                    times=[0.45], ch_type='eeg', average=0.1,
-                    colorbar=True, show=False, time_unit='s')
+                fig = evk.plot_topomap(**avg_kw)
                 w, h = fig.get_size_inches()
                 fig.set_size_inches(w + 1.5, h + 0.8)
                 for ax in fig.get_axes():
@@ -573,7 +782,7 @@ def main():
             if group not in grand_avgs or cond not in grand_avgs[group]:
                 continue
             evk = grand_avgs[group][cond]
-            fig = plot_peak_topomaps(evk, f'{cond} [{group}]')
+            fig = plot_peak_topomaps(evk, f'{cond} [{group}]', vlim=vlim)
             report.add_figure(fig,
                               title=f'{cond} [{group}] — Peak topography',
                               tags=('topomap', 'group', 'electrodes'))
@@ -687,6 +896,38 @@ def main():
                               title=f'BTP vs BBTP vs BBBTP [{group}]',
                               tags=('comparison', 'between-block'))
             plt.close(fig)
+
+    # Section 5: Difference topomaps per group (reviewer request ко.docx)
+    DIFF_TOPO_PAIRS = [
+        ('BTR', 'BTP'),
+        ('BBTR', 'BBTP'),
+        ('BBBTR', 'BBBTP'),
+        ('BLPPPP', 'BLP'),
+        ('BTR', 'BLRR'),
+    ]
+    logger.info('Plotting difference topomaps per group...')
+    for cond_a, cond_b in DIFF_TOPO_PAIRS:
+        for group in ('healthy', 'disorder'):
+            if group not in grand_avgs:
+                continue
+            ga = grand_avgs[group]
+            if cond_a not in ga or cond_b not in ga:
+                continue
+            fig = plot_difference_topomap(
+                ga[cond_a], ga[cond_b], cond_a, cond_b,
+                f'{cond_a} vs {cond_b} [{group}]')
+            report.add_figure(fig,
+                              title=f'{cond_a} vs {cond_b} [{group}] — Diff topo',
+                              tags=('topomap', 'difference', 'group'))
+            plt.close(fig)
+
+    # Section 6: Mann-Whitney U statistics table
+    if stats_results:
+        fig = plot_statistics_table(stats_results)
+        report.add_figure(fig,
+                          title='Mann-Whitney U — Healthy vs Disorder',
+                          tags=('statistics', 'group'))
+        plt.close(fig)
 
     # Save report
     report_path = output_dir / 'n400_group_report.html'
