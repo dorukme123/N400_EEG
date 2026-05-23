@@ -279,59 +279,70 @@ def measure_n400(evoked, electrodes):
 
 # ── Statistics ──────────────────────────────────────────────────────────────
 
-def measure_n400_individual(evoked, electrodes):
-    """Measure mean N400 amplitude (200-600 ms) for each electrode.
+# ROI pools for statistical testing
+ROI_POOLS = {
+    'Parietal': ['Pz', 'P3', 'P4'],
+    'Central':  ['Cz', 'C3', 'C4', 'CP1', 'CP2'],
+}
 
-    Returns dict: {electrode: mean_amplitude_uV}
+
+def measure_n400_roi_pools(evoked):
+    """Measure mean N400 amplitude (200-600 ms) per ROI pool.
+
+    Returns dict: {'Parietal': mean_uV, 'Central': mean_uV}
     """
     t_mask = (evoked.times >= N400_TMIN) & (evoked.times <= N400_TMAX)
     if not t_mask.any():
         return {}
     results = {}
-    for ch in electrodes:
-        if ch not in evoked.ch_names:
+    for roi_name, channels in ROI_POOLS.items():
+        available = [ch for ch in channels if ch in evoked.ch_names]
+        if not available:
             continue
-        idx = evoked.ch_names.index(ch)
-        data_uv = evoked.data[idx, t_mask] * 1e6
-        results[ch] = data_uv.mean()
-    # Cluster average
-    available = [ch for ch in electrodes if ch in evoked.ch_names]
-    if available:
         idxs = [evoked.ch_names.index(ch) for ch in available]
-        results['cluster'] = (evoked.data[idxs][:, t_mask] * 1e6).mean()
+        roi_mean = evoked.data[idxs][:, t_mask].mean(axis=0) * 1e6
+        results[roi_name] = roi_mean.mean()
     return results
 
 
-def run_group_statistics(patients, groups, conditions, electrodes, logger):
-    """Run Mann-Whitney U tests comparing healthy vs disorder per condition/electrode.
+def rank_biserial(u_stat, n1, n2):
+    """Compute rank-biserial correlation from Mann-Whitney U statistic.
 
-    Applies Bonferroni correction across the 6 test conditions (not per-electrode,
-    since ROI electrodes are spatially correlated and treated as a descriptive breakdown).
+    r = 1 - (2U) / (n1 * n2), ranges from -1 to +1.
+    """
+    return 1.0 - (2.0 * u_stat) / (n1 * n2)
+
+
+def run_group_statistics(patients, groups, conditions, electrodes, logger):
+    """Run Mann-Whitney U tests comparing healthy vs disorder per condition × ROI pool.
+
+    Uses 2 ROI pools (Parietal: Pz/P3/P4, Central: Cz/C3/C4/CP1/CP2).
+    Bonferroni correction: 6 conditions × 2 ROIs = 12 comparisons.
+    Effect size: rank-biserial correlation.
 
     Returns list of dicts with test results, suitable for CSV export.
     """
     test_conditions = [c for c in conditions
                        if c in ('BTR', 'BTP', 'BBTR', 'BBTP', 'BBBTR', 'BBBTP')]
-    n_comparisons = len(test_conditions)
-    all_electrodes = list(electrodes) + ['cluster']
+    n_comparisons = len(test_conditions) * len(ROI_POOLS)  # 6 × 2 = 12
 
     results = []
 
     for cond in test_conditions:
-        for elec in all_electrodes:
+        for roi_name in ROI_POOLS:
             healthy_vals = []
             disorder_vals = []
 
             for pid, pdata in patients.items():
                 if cond not in pdata:
                     continue
-                metrics = measure_n400_individual(pdata[cond], electrodes)
-                if elec not in metrics:
+                metrics = measure_n400_roi_pools(pdata[cond])
+                if roi_name not in metrics:
                     continue
                 if groups[pid] == 'healthy':
-                    healthy_vals.append(metrics[elec])
+                    healthy_vals.append(metrics[roi_name])
                 else:
-                    disorder_vals.append(metrics[elec])
+                    disorder_vals.append(metrics[roi_name])
 
             if len(healthy_vals) < 2 or len(disorder_vals) < 2:
                 continue
@@ -339,10 +350,11 @@ def run_group_statistics(patients, groups, conditions, electrodes, logger):
             stat, p_raw = mannwhitneyu(healthy_vals, disorder_vals,
                                        alternative='two-sided')
             p_bonf = min(p_raw * n_comparisons, 1.0)
+            r_rb = rank_biserial(stat, len(healthy_vals), len(disorder_vals))
 
             results.append({
                 'condition': cond,
-                'electrode': elec,
+                'roi': roi_name,
                 'n_healthy': len(healthy_vals),
                 'n_disorder': len(disorder_vals),
                 'mean_healthy': np.mean(healthy_vals),
@@ -350,6 +362,7 @@ def run_group_statistics(patients, groups, conditions, electrodes, logger):
                 'U_statistic': stat,
                 'p_raw': p_raw,
                 'p_bonferroni': p_bonf,
+                'rank_biserial': r_rb,
                 'significant_raw': p_raw < 0.05,
                 'significant_bonf': p_bonf < 0.05,
             })
@@ -373,52 +386,63 @@ def export_statistics_csv(stats_results, output_path, logger):
     with open(str(output_path), 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'Condition', 'Electrode', 'N_Healthy', 'N_Disorder',
+            'Condition', 'ROI', 'N_Healthy', 'N_Disorder',
             'Mean_Healthy_uV', 'Mean_Disorder_uV',
             'U_Statistic', 'p_raw', 'p_Bonferroni',
-            'Sig_raw_p05', 'Sig_Bonferroni_p05',
+            'Rank_Biserial_r', 'Sig_raw_p05', 'Sig_Bonferroni_p05',
         ])
         for r in stats_results:
             writer.writerow([
-                r['condition'], r['electrode'],
+                r['condition'], r['roi'],
                 r['n_healthy'], r['n_disorder'],
                 f'{r["mean_healthy"]:.3f}', f'{r["mean_disorder"]:.3f}',
                 f'{r["U_statistic"]:.1f}',
                 f'{r["p_raw"]:.6f}', f'{r["p_bonferroni"]:.6f}',
+                f'{r["rank_biserial"]:.3f}',
                 r['significant_raw'], r['significant_bonf'],
             ])
     logger.info(f'Statistics CSV saved: {output_path}')
 
 
 def plot_statistics_table(stats_results, title='Mann-Whitney U: Healthy vs Disorder'):
-    """Create a figure with a summary table of significant results."""
-    sig = [r for r in stats_results if r['significant_raw']]
-    if not sig:
+    """Create a figure with a full results table (all ROI × condition tests)."""
+    if not stats_results:
         fig, ax = plt.subplots(figsize=(8, 2))
-        ax.text(0.5, 0.5, 'No significant differences (raw p < 0.05)',
+        ax.text(0.5, 0.5, 'No statistical tests performed',
                 ha='center', va='center', fontsize=12)
         ax.axis('off')
         return fig
 
-    col_labels = ['Condition', 'Electrode', 'Healthy mean', 'Disorder mean',
-                  'U', 'p (raw)', 'p (Bonf.)', 'Sig (Bonf.)']
+    col_labels = ['Condition', 'ROI', 'Healthy mean', 'Disorder mean',
+                  'U', 'r (rank-bis.)', 'p (raw)', 'p (Bonf.)', 'Sig']
     cell_text = []
     cell_colors = []
-    for r in sig:
+    for r in stats_results:
+        sig_label = ''
+        if r['significant_bonf']:
+            sig_label = '**'
+        elif r['significant_raw']:
+            sig_label = '*'
         row = [
-            r['condition'], r['electrode'],
+            r['condition'], r['roi'],
             f'{r["mean_healthy"]:.2f}', f'{r["mean_disorder"]:.2f}',
             f'{r["U_statistic"]:.0f}',
+            f'{r["rank_biserial"]:.3f}',
             f'{r["p_raw"]:.4f}', f'{r["p_bonferroni"]:.4f}',
-            'Yes' if r['significant_bonf'] else 'No',
+            sig_label,
         ]
         cell_text.append(row)
-        bg = '#d4edda' if r['significant_bonf'] else '#fff3cd'
+        if r['significant_bonf']:
+            bg = '#d4edda'
+        elif r['significant_raw']:
+            bg = '#fff3cd'
+        else:
+            bg = 'white'
         cell_colors.append([bg] * len(row))
 
     n_rows = len(cell_text)
-    fig_h = max(2.5, 0.4 * n_rows + 1.5)
-    fig, ax = plt.subplots(figsize=(14, fig_h))
+    fig_h = max(3.0, 0.4 * n_rows + 2.0)
+    fig, ax = plt.subplots(figsize=(16, fig_h))
     ax.axis('off')
     ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
 
@@ -429,6 +453,14 @@ def plot_statistics_table(stats_results, title='Mann-Whitney U: Healthy vs Disor
     table.auto_set_font_size(False)
     table.set_fontsize(8)
     table.scale(1.0, 1.3)
+
+    # Legend
+    ax.text(0.01, 0.01,
+            '** = significant after Bonferroni correction (p < 0.05)   '
+            '* = significant uncorrected only   '
+            'r = rank-biserial correlation',
+            transform=ax.transAxes, fontsize=7, va='bottom')
+
     fig.tight_layout()
     return fig
 
