@@ -1343,6 +1343,7 @@ def plot_peak_topomaps(evoked, title, vlim=None):
 def process_single_file(vhdr_path, output_dir, log_dir, logger,
                         epoch_reject_uv=EPOCH_REJECT_DEFAULT,
                         detrend=False, uniform_scale=False,
+                        ylim_fixed=None,
                         l_freq=FILTER_L_FREQ, h_freq=PREPROCESS_H_FREQ,
                         n_jobs=1):
     """Run the full N400 processing pipeline on a single recording."""
@@ -1589,9 +1590,12 @@ def process_single_file(vhdr_path, output_dir, log_dir, logger,
                 [evokeds[real_cond], evokeds[pseudo_cond]], weights=[1, -1])
             n400_diffs[diff_name].comment = diff_name
 
-    # ── Compute uniform y-axis limits if requested ────────────────────
+    # ── Compute y-axis limits ───────────────────────────────────────────
     ylim = None
-    if uniform_scale:
+    if ylim_fixed is not None:
+        ylim = (-ylim_fixed, ylim_fixed)
+        logger.info(f'Fixed y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
+    elif uniform_scale:
         ylim = compute_uniform_ylim(evokeds, N400_ROI_CHS)
         if ylim:
             logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
@@ -1830,6 +1834,10 @@ def parse_args():
                         help='Apply linear detrending to epochs')
     parser.add_argument('--uniform-scale', action='store_true',
                         help='Use the same y-axis scale across all ERP plots')
+    parser.add_argument('--ylim', type=float, default=None,
+                        help='Fixed symmetric y-axis limit in uV '
+                             '(e.g. --ylim 8 for -8 to +8 uV). '
+                             'Overrides --uniform-scale.')
     parser.add_argument('--parallel', type=int, default=1, metavar='N',
                         help='Process N patients in parallel (default: 1 = '
                              'sequential)')
@@ -1861,7 +1869,8 @@ def _collect_result(status, pid, payload,
 
 
 def _process_one(vhdr_path, output_dir, log_dir, epoch_reject_uv,
-                  detrend, uniform_scale, l_freq, h_freq, n_jobs, verbose):
+                  detrend, uniform_scale, ylim_fixed,
+                  l_freq, h_freq, n_jobs, verbose):
     """Worker function for processing a single patient.
 
     Designed to run in a separate process via ProcessPoolExecutor.
@@ -1882,6 +1891,7 @@ def _process_one(vhdr_path, output_dir, log_dir, epoch_reject_uv,
                                      epoch_reject_uv=epoch_reject_uv,
                                      detrend=detrend,
                                      uniform_scale=uniform_scale,
+                                     ylim_fixed=ylim_fixed,
                                      l_freq=l_freq, h_freq=h_freq,
                                      n_jobs=n_jobs)
         if result is None:
@@ -1937,8 +1947,8 @@ def main():
         for vhdr_path in vhdr_files:
             status, pid, payload = _process_one(
                 vhdr_path, output_dir, log_dir, epoch_reject_uv,
-                args.detrend, args.uniform_scale, args.l_freq, args.h_freq,
-                n_fig_jobs, args.verbose)
+                args.detrend, args.uniform_scale, args.ylim,
+                args.l_freq, args.h_freq, n_fig_jobs, args.verbose)
             _collect_result(status, pid, payload,
                             clean_patients, noisy_patients, skipped, failures)
     else:
@@ -1951,7 +1961,8 @@ def main():
                 fut = pool.submit(
                     _process_one, vhdr_path, output_dir, log_dir,
                     epoch_reject_uv, args.detrend, args.uniform_scale,
-                    args.l_freq, args.h_freq, n_fig_jobs, args.verbose)
+                    args.ylim, args.l_freq, args.h_freq,
+                    n_fig_jobs, args.verbose)
                 futures[fut] = vhdr_path
             for fut in as_completed(futures):
                 vhdr_path = futures[fut]

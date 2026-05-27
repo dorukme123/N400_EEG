@@ -1,0 +1,194 @@
+N400s_EEG — Command Reference
+==============================
+
+This project has 3 scripts. All are run from the project root directory.
+
+
+================================================================================
+1. process_n400.py — Individual Patient Processing Pipeline
+================================================================================
+
+Processes BrainVision EEG files (.vhdr) through the full N400 pipeline:
+ICA artifact removal, epoching, ERP averaging, N400 analysis, and generates
+a self-contained HTML report per patient.
+
+Required arguments:
+  --input INPUT     Path to a patient folder (e.g. inputs/INP0089) or a
+                    specific .vhdr file. If a directory is given, all .vhdr
+                    files inside it (recursively) are processed.
+  --output OUTPUT   Output directory for reports, CSVs, and .fif files.
+
+Optional arguments:
+  --reject REJECT   Epoch rejection threshold in uV (peak-to-peak).
+                    Default: 150. Use "none" to disable rejection entirely.
+  --l-freq L_FREQ   High-pass filter cutoff in Hz. Default: 0.1.
+  --h-freq H_FREQ   Low-pass filter cutoff in Hz. Default: 45.0.
+  --detrend         Apply linear detrending to each epoch before baseline
+                    correction. Helps remove slow drifts.
+  --uniform-scale   Force the same y-axis limits on all ERP plots within a
+                    report. Makes it easy to visually compare conditions and
+                    spot noisy data.
+  --ylim YLIM       Fixed symmetric y-axis limit in uV. E.g. --ylim 8 sets
+                    the y-axis to -8..+8 uV on all ERP plots. Overrides
+                    --uniform-scale if both are given.
+  --parallel N      Process N patients simultaneously using separate processes.
+                    Default: 1 (sequential). Set to number of CPU cores for
+                    maximum speed (e.g. --parallel 4).
+  --jobs J          Number of threads for rendering report figures within
+                    each patient. Default: 4. Higher values speed up the
+                    ~50 figures generated per report.
+  --verbose         Enable verbose MNE-Python logging output.
+
+Output files (per patient):
+  {PID}_{visit}_individual_report.html   Full HTML report with figures
+  {PID}_{visit}-ave.fif                  Evoked responses for group analysis
+  {PID}_per_trial_n400.csv               Per-trial N400 peak table
+
+Output files (batch):
+  qc_summary.txt                         Classification of all patients as
+                                         CLEAN or NOISY with epoch stats
+
+Examples:
+
+  # Process one patient with default settings
+  python process_n400.py --input inputs/INP0089 --output outputs/
+
+  # Process all patients in inputs/
+  python process_n400.py --input inputs/ --output outputs/
+
+  # Custom rejection threshold
+  python process_n400.py --input inputs/ --output outputs/ --reject 200
+
+  # Disable epoch rejection entirely
+  python process_n400.py --input inputs/ --output outputs/ --reject none
+
+  # Custom filter band (e.g. 0.3-30 Hz)
+  python process_n400.py --input inputs/ --output outputs/ --l-freq 0.3 --h-freq 30
+
+  # Linear detrending + uniform scale for QC review
+  python process_n400.py --input inputs/ --output outputs/ --detrend --uniform-scale
+
+  # Fixed ±8 uV y-axis scale
+  python process_n400.py --input inputs/ --output outputs/ --ylim 8
+
+  # Process 4 patients in parallel
+  python process_n400.py --input inputs/ --output outputs/ --parallel 4
+
+  # All optional flags combined
+  python process_n400.py --input inputs/ --output outputs/ \
+      --reject 200 --l-freq 0.1 --h-freq 40 --detrend --uniform-scale --parallel 4
+
+
+================================================================================
+2. group_analysis_n400.py — Group Grand Averages and Planned Comparisons
+================================================================================
+
+Loads individual *-ave.fif files produced by process_n400.py, computes grand
+averages per group (healthy controls vs speech disorder), runs within-block
+and between-block planned comparisons, and generates an HTML report + CSV.
+
+Only patients listed in the HEALTHY (46) or SPEECH_DISORDER (16) sets are
+included. Unknown and excluded patients (9) are skipped automatically.
+
+Required arguments:
+  --input INPUT     Directory containing *-ave.fif files (typically outputs/).
+  --output OUTPUT   Output directory for the group report and CSV table.
+
+Optional arguments:
+  --uniform-scale   Force the same y-axis limits on all ERP plots in the
+                    group report.
+  --ylim YLIM       Fixed symmetric y-axis limit in uV. E.g. --ylim 8 sets
+                    the y-axis to -8..+8 uV on all ERP plots. Overrides
+                    --uniform-scale if both are given.
+
+Output files:
+  n400_group_report.html               HTML report with group comparisons,
+                                       topographies, per-electrode grids,
+                                       best N400 channels, planned comparisons,
+                                       difference topomaps, statistics tables,
+                                       block progression plots, and 3-way overlays
+  n400_group_table.csv                 N400 metrics (mean amp, peak amp, peak
+                                       latency, 50% area latency) per
+                                       group/condition/electrode
+  n400_group_statistics.csv            Mann-Whitney U test results (healthy vs
+                                       disorder) with Bonferroni correction
+  n400_within_group_statistics.csv     Wilcoxon signed-rank tests for block
+                                       progression within each group (Block 1
+                                       vs 2, 1 vs 3, 2 vs 3)
+
+Examples:
+
+  # Basic group analysis
+  python group_analysis_n400.py --input outputs/ --output outputs/group/
+
+  # With uniform y-axis scale
+  python group_analysis_n400.py --input outputs/ --output outputs/group/ --uniform-scale
+
+  # With fixed ±8 uV y-axis
+  python group_analysis_n400.py --input outputs/ --output outputs/group/ --ylim 8
+
+
+================================================================================
+3. copy_n400_raw.py — Copy Raw Data from Network Drive
+================================================================================
+
+Copies raw BrainVision EEG files from the Z: network drive to local inputs/
+directory. Uses the mapping file (z_drive_n400_raw_mapping.txt) to locate
+the correct files.
+
+Required arguments:
+  (none — uses defaults)
+
+Optional arguments:
+  --server SERVER     Override the base network path. Default is Z: drive.
+                      Use e.g. /mnt/z/Academic_perfomance/Data/EEG_behav_data
+                      on Linux.
+  --output OUTPUT     Local output directory. Default: inputs/
+  --patients P1 P2..  Copy only specific patient IDs (e.g. --patients INP0089
+                      INP0100). Default: copy all.
+  --dry-run           Preview what would be copied without actually copying.
+  --mapping MAPPING   Path to the mapping file. Default:
+                      z_drive_n400_raw_mapping.txt
+
+Examples:
+
+  # Preview all copies
+  python copy_n400_raw.py --dry-run
+
+  # Copy all patients
+  python copy_n400_raw.py
+
+  # Copy specific patients only
+  python copy_n400_raw.py --patients INP0089 INP0100 INP0019
+
+  # Use Linux mount path
+  python copy_n400_raw.py --server /mnt/z/Academic_perfomance/Data/EEG_behav_data
+
+
+================================================================================
+Typical Full Workflow
+================================================================================
+
+  1. Copy raw data from network drive:
+     python copy_n400_raw.py
+
+  2. Process all patients (parallel, with detrend and uniform scale):
+     python process_n400.py --input inputs/ --output outputs/ \
+         --parallel 4 --jobs 4 --detrend --uniform-scale
+
+  3. Review qc_summary.txt to check clean vs noisy classification:
+     cat outputs/qc_summary.txt
+
+  4. Run group analysis:
+     python group_analysis_n400.py --input outputs/ --output outputs/group/
+
+  5. Open reports:
+     outputs/{PID}_*_individual_report.html   (individual)
+     outputs/group/n400_group_report.html     (group)
+
+
+================================================================================
+Install Dependencies
+================================================================================
+
+  pip install -r requirements.txt

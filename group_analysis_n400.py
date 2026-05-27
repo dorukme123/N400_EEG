@@ -33,7 +33,7 @@ import csv
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
-from scipy.stats import mannwhitneyu
+from scipy.stats import mannwhitneyu, wilcoxon
 
 from process_n400 import (compute_uniform_vlim, compute_uniform_ylim,
                           find_best_n400_channels,
@@ -112,6 +112,16 @@ BETWEEN_BLOCK = [
     ('(BTR+BBTR) vs BTP', ('BTR', 'BBTR'), 'BTP'),
     ('(BTR+BBTR) vs BBTP', ('BTR', 'BBTR'), 'BBTP'),
     ('BBBTR vs BBBTP', 'BBBTR', 'BBBTP'),
+]
+
+# Within-group block progression comparisons (Wilcoxon signed-rank)
+WITHIN_GROUP_BLOCK = [
+    ('Real: Block1 vs Block2', 'BTR', 'BBTR'),
+    ('Real: Block1 vs Block3', 'BTR', 'BBBTR'),
+    ('Real: Block2 vs Block3', 'BBTR', 'BBBTR'),
+    ('Pseudo: Block1 vs Block2', 'BTP', 'BBTP'),
+    ('Pseudo: Block1 vs Block3', 'BTP', 'BBBTP'),
+    ('Pseudo: Block2 vs Block3', 'BBTP', 'BBBTP'),
 ]
 
 
@@ -465,6 +475,170 @@ def plot_statistics_table(stats_results, title='Mann-Whitney U: Healthy vs Disor
     return fig
 
 
+# ── Within-group block progression statistics ────────────────────────────────
+
+def run_within_group_statistics(patients, groups, logger):
+    """Run Wilcoxon signed-rank tests for block progression within each group.
+
+    Compares test conditions across blocks (Block 1 vs 2, 1 vs 3, 2 vs 3)
+    separately for healthy and disorder groups.
+    Bonferroni correction: 6 comparisons × 2 ROI pools × 2 groups = 24.
+    Effect size: paired Cohen's d.
+    """
+    n_comparisons = len(WITHIN_GROUP_BLOCK) * len(ROI_POOLS) * 2
+
+    results = []
+
+    for group in ('healthy', 'disorder'):
+        group_pids = [pid for pid, g in groups.items() if g == group]
+
+        for comp_name, cond_a, cond_b in WITHIN_GROUP_BLOCK:
+            for roi_name in ROI_POOLS:
+                vals_a = []
+                vals_b = []
+
+                for pid in group_pids:
+                    if pid not in patients:
+                        continue
+                    pdata = patients[pid]
+                    if cond_a not in pdata or cond_b not in pdata:
+                        continue
+                    metrics_a = measure_n400_roi_pools(pdata[cond_a])
+                    metrics_b = measure_n400_roi_pools(pdata[cond_b])
+                    if roi_name in metrics_a and roi_name in metrics_b:
+                        vals_a.append(metrics_a[roi_name])
+                        vals_b.append(metrics_b[roi_name])
+
+                if len(vals_a) < 5:
+                    continue
+
+                try:
+                    stat, p_raw = wilcoxon(vals_a, vals_b,
+                                           alternative='two-sided')
+                except ValueError:
+                    continue
+
+                p_bonf = min(p_raw * n_comparisons, 1.0)
+
+                # Paired Cohen's d
+                diffs = np.array(vals_a) - np.array(vals_b)
+                d_std = np.std(diffs, ddof=1)
+                cohens_d = float(np.mean(diffs) / d_std) if d_std > 0 else 0.0
+
+                results.append({
+                    'group': group,
+                    'comparison': comp_name,
+                    'cond_a': cond_a,
+                    'cond_b': cond_b,
+                    'roi': roi_name,
+                    'n_pairs': len(vals_a),
+                    'mean_cond_a': np.mean(vals_a),
+                    'mean_cond_b': np.mean(vals_b),
+                    'W_statistic': stat,
+                    'p_raw': p_raw,
+                    'p_bonferroni': p_bonf,
+                    'cohens_d': cohens_d,
+                    'significant_raw': p_raw < 0.05,
+                    'significant_bonf': p_bonf < 0.05,
+                })
+
+    logger.info(f'Wilcoxon signed-rank tests: {len(results)} comparisons, '
+                f'Bonferroni factor = {n_comparisons}')
+    sig_raw = sum(1 for r in results if r['significant_raw'])
+    sig_bonf = sum(1 for r in results if r['significant_bonf'])
+    logger.info(f'  Significant (raw p<0.05): {sig_raw}')
+    logger.info(f'  Significant (Bonferroni p<0.05): {sig_bonf}')
+
+    return results
+
+
+def export_within_group_statistics_csv(stats_results, output_path, logger):
+    """Export Wilcoxon signed-rank test results to CSV."""
+    if not stats_results:
+        logger.warning('No within-group statistics to export')
+        return
+
+    with open(str(output_path), 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'Group', 'Comparison', 'Cond_A', 'Cond_B', 'ROI', 'N_Pairs',
+            'Mean_A_uV', 'Mean_B_uV',
+            'W_Statistic', 'p_raw', 'p_Bonferroni',
+            'Cohens_d', 'Sig_raw_p05', 'Sig_Bonferroni_p05',
+        ])
+        for r in stats_results:
+            writer.writerow([
+                r['group'], r['comparison'], r['cond_a'], r['cond_b'],
+                r['roi'], r['n_pairs'],
+                f'{r["mean_cond_a"]:.3f}', f'{r["mean_cond_b"]:.3f}',
+                f'{r["W_statistic"]:.1f}',
+                f'{r["p_raw"]:.6f}', f'{r["p_bonferroni"]:.6f}',
+                f'{r["cohens_d"]:.3f}',
+                r['significant_raw'], r['significant_bonf'],
+            ])
+    logger.info(f'Within-group statistics CSV saved: {output_path}')
+
+
+def plot_within_group_statistics_table(stats_results, title):
+    """Create a figure with within-group block comparison results table."""
+    if not stats_results:
+        fig, ax = plt.subplots(figsize=(8, 2))
+        ax.text(0.5, 0.5, 'No within-group tests performed',
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+
+    col_labels = ['Comparison', 'ROI', 'N', 'Mean A', 'Mean B',
+                  'W', "Cohen's d", 'p (raw)', 'p (Bonf.)', 'Sig']
+    cell_text = []
+    cell_colors = []
+    for r in stats_results:
+        sig_label = ''
+        if r['significant_bonf']:
+            sig_label = '**'
+        elif r['significant_raw']:
+            sig_label = '*'
+        row = [
+            r['comparison'], r['roi'], str(r['n_pairs']),
+            f'{r["mean_cond_a"]:.2f}', f'{r["mean_cond_b"]:.2f}',
+            f'{r["W_statistic"]:.0f}',
+            f'{r["cohens_d"]:.3f}',
+            f'{r["p_raw"]:.4f}', f'{r["p_bonferroni"]:.4f}',
+            sig_label,
+        ]
+        cell_text.append(row)
+        if r['significant_bonf']:
+            bg = '#d4edda'
+        elif r['significant_raw']:
+            bg = '#fff3cd'
+        else:
+            bg = 'white'
+        cell_colors.append([bg] * len(row))
+
+    n_rows = len(cell_text)
+    fig_h = max(3.0, 0.4 * n_rows + 2.0)
+    fig, ax = plt.subplots(figsize=(16, fig_h))
+    ax.axis('off')
+    ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
+
+    table = ax.table(cellText=cell_text, colLabels=col_labels,
+                     cellColours=cell_colors,
+                     colColours=['#d0d0d0'] * len(col_labels),
+                     loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.3)
+
+    ax.text(0.01, 0.01,
+            "** = significant after Bonferroni   "
+            "* = significant uncorrected   "
+            "Cohen's d = paired effect size",
+            transform=ax.transAxes, fontsize=7, va='bottom')
+
+    fig.tight_layout()
+    return fig
+
+
 # ── Figures ──────────────────────────────────────────────────────────────────
 
 def plot_group_comparison(grand_avgs, cond, roi_chs, title=None, ylim=None):
@@ -667,6 +841,10 @@ def main():
                         help='Output directory for group report and CSV')
     parser.add_argument('--uniform-scale', action='store_true',
                         help='Use the same y-axis scale across all ERP plots')
+    parser.add_argument('--ylim', type=float, default=None,
+                        help='Fixed symmetric y-axis limit in uV '
+                             '(e.g. --ylim 8 for -8 to +8 uV). '
+                             'Overrides --uniform-scale.')
     args = parser.parse_args()
 
     mne.set_log_level('WARNING')
@@ -715,7 +893,10 @@ def main():
         if group in grand_avgs:
             for cond, evk in grand_avgs[group].items():
                 all_evokeds[f'{cond}_{group}'] = evk
-    if args.uniform_scale:
+    if args.ylim is not None:
+        ylim = (-args.ylim, args.ylim)
+        logger.info(f'Fixed y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
+    elif args.uniform_scale:
         ylim = compute_uniform_ylim(all_evokeds, N400_ROI_CHS)
         if ylim:
             logger.info(f'Uniform y-axis: {ylim[0]:.1f} to {ylim[1]:.1f} uV')
@@ -928,6 +1109,42 @@ def main():
                               tags=('comparison', 'between-block'))
             plt.close(fig)
 
+    # Section 4b: BTR vs BBTR vs BBBTR (per group) — block progression for real words
+    logger.info('Plotting BTR vs BBTR vs BBBTR...')
+    for group in ('healthy', 'disorder'):
+        if group not in grand_avgs:
+            continue
+        ga = grand_avgs[group]
+        evks = [ga.get('BTR'), ga.get('BBTR'), ga.get('BBBTR')]
+        labels = ['BTR (Block 1)', 'BBTR (Block 2)', 'BBBTR (Block 3)']
+        valid = [(e, l) for e, l in zip(evks, labels) if e is not None]
+        if len(valid) >= 2:
+            fig = plot_three_way(
+                [v[0] for v in valid], [v[1] for v in valid],
+                N400_ROI_CHS,
+                f'BTR vs BBTR vs BBBTR [{group}]', ylim=ylim)
+            report.add_figure(fig,
+                              title=f'BTR vs BBTR vs BBBTR [{group}]',
+                              tags=('comparison', 'block-progression'))
+            plt.close(fig)
+
+    # Section 4c: Direct within-group block comparison pairs
+    logger.info('Plotting within-group block comparison pairs...')
+    for comp_name, cond_a, cond_b in WITHIN_GROUP_BLOCK:
+        for group in ('healthy', 'disorder'):
+            if group not in grand_avgs:
+                continue
+            ga = grand_avgs[group]
+            if cond_a not in ga or cond_b not in ga:
+                continue
+            fig = plot_comparison_pair(
+                ga[cond_a], ga[cond_b], cond_a, cond_b,
+                N400_ROI_CHS,
+                f'{comp_name} [{group}]', ylim=ylim)
+            report.add_figure(fig, title=f'{comp_name} [{group}]',
+                              tags=('comparison', 'block-progression'))
+            plt.close(fig)
+
     # Section 5: Difference topomaps per group (reviewer request ко.docx)
     DIFF_TOPO_PAIRS = [
         ('BTR', 'BTP'),
@@ -959,6 +1176,24 @@ def main():
                           title='Mann-Whitney U — Healthy vs Disorder',
                           tags=('statistics', 'group'))
         plt.close(fig)
+
+    # Section 7: Within-group block progression statistics (Wilcoxon)
+    logger.info('Running within-group block comparison statistics (Wilcoxon)...')
+    within_stats = run_within_group_statistics(patients, groups, logger)
+    if within_stats:
+        within_csv = output_dir / 'n400_within_group_statistics.csv'
+        export_within_group_statistics_csv(within_stats, within_csv, logger)
+
+        for group in ('healthy', 'disorder'):
+            group_stats = [r for r in within_stats if r['group'] == group]
+            if group_stats:
+                fig = plot_within_group_statistics_table(
+                    group_stats,
+                    f'Wilcoxon: Block progression ({group.capitalize()})')
+                report.add_figure(fig,
+                                  title=f'Wilcoxon — Block progression [{group}]',
+                                  tags=('statistics', 'block-progression'))
+                plt.close(fig)
 
     # Save report
     report_path = output_dir / 'n400_group_report.html'
